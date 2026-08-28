@@ -94,7 +94,7 @@ test "lumina2 (zib, no prefix)" {
 }
 
 test "qwen" {
-    try expectArch(@embedFile("test_fixtures/qwen.json"), "qwen");
+    try expectArch(@embedFile("test_fixtures/qwen.json"), "qwen_image");
 }
 
 test "ernie" {
@@ -103,6 +103,13 @@ test "ernie" {
 
 test "krea2 (native single-file)" {
     try expectArch(@embedFile("test_fixtures/krea2.json"), "krea2");
+}
+
+// Dumped from a pruned int8_convrot bake, so the fixture still carries the
+// `.weight_scale` / `.comfy_quant` sidecars a cluster checkpoint ships with.
+// Detection runs before cluster collapse and must not care.
+test "minimax h3 (pruned int8_convrot)" {
+    try expectArch(@embedFile("test_fixtures/minimax_h3.json"), "minimax_h3");
 }
 
 // Mage-Flow's tensor names are byte-for-byte the same set as Qwen-Image's, so
@@ -124,5 +131,5 @@ test "mageflow names alone are indistinguishable from qwen-image" {
     defer allocator.free(names);
     for (parsed.value, 0..) |e, i| names[i] = e.name;
 
-    try std.testing.expectEqualStrings("qwen", imagearch.detectArch(names).?.name);
+    try std.testing.expectEqualStrings("qwen_image", imagearch.detectArch(names).?.name);
 }
