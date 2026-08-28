@@ -15,6 +15,16 @@ pub const ShapeRule = struct {
     extent: usize,
 };
 
+/// A key that only needs protecting when its rows are short. Some checkpoints ship
+/// the same layer either full-width or projected onto a small basis; the wide form
+/// quantizes fine, while the narrow form would put many unrelated rows in one block.
+pub const NarrowRule = struct {
+    /// Tensor name substring, matched the same way `keys_hiprec` is.
+    key: []const u8,
+    /// Protect when the contiguous (last) dimension is below this.
+    below_cols: usize,
+};
+
 /// Represents a model architecture with its detection keys and configuration
 pub const Arch = struct {
     /// String describing architecture name
@@ -33,6 +43,8 @@ pub const Arch = struct {
     shape_detect: []const ShapeRule = &.{},
     /// Keys that need to be kept in fp32/high precision
     keys_hiprec: []const []const u8 = &.{},
+    /// Keys kept high-precision only in their narrow form (see NarrowRule)
+    keys_hiprec_narrow: []const NarrowRule = &.{},
     /// Key substrings to ignore when found
     keys_ignore: []const []const u8 = &.{},
     /// Quantization threshhold specific to a model, or fall back to default
@@ -85,6 +97,17 @@ pub const Arch = struct {
             if (std.mem.indexOf(u8, key, hiprec) != null) {
                 return true;
             }
+        }
+        return false;
+    }
+
+    /// Check if a key should be kept in high precision given the shape it arrived with.
+    /// `dims` is outermost-first, so the contiguous extent is the last entry.
+    pub fn isNarrowHighPrecision(self: Arch, key: []const u8, dims: []const usize) bool {
+        if (dims.len == 0) return false;
+        const cols = dims[dims.len - 1];
+        for (self.keys_hiprec_narrow) |rule| {
+            if (cols < rule.below_cols and std.mem.indexOf(u8, key, rule.key) != null) return true;
         }
         return false;
     }
@@ -592,6 +615,71 @@ pub const krea2 = Arch{
     },
 };
 
+// MiniMax H3: a single-stream packed-token DiT that denoises video (24ch, patch
+// 1x2x2) and stereo audio (32ch) latents jointly, conditioned on Qwen3-VL layer-50
+// hidden states. Every weight is 1-D or 2-D — there are no convolutions — so the
+// GGUF shape fix is not needed. `minimax_h3` is the `image_model` string ComfyUI
+// assigns, used verbatim as `general.architecture`.
+//
+// The paired detect keys are the same ones ComfyUI keys off, and no other
+// architecture carries an audio and a video patch projection side by side.
+//
+// Two checkpoint forms exist and the policy has to cover both. The full form
+// stores each block's AdaLN projection at the time-embedding width (2688), which
+// is 13B of the model's 33B parameters and must stay quantizable. The pruned form
+// replaces it with 8 coordinates on a shared basis of the time-embedding curve
+// (`adaln_t_table`), which is where keys_hiprec_narrow comes in: a 256-element
+// block over 8-wide rows would mix the shift, scale and gate of 32 unrelated
+// modulation rows. ComfyUI's own int8 bake of the pruned form leaves it at fp16.
+pub const minimax_h3 = Arch{
+    .name = "minimax_h3",
+    .keys_detect = &.{
+        &.{ "video_patch_proj.weight", "audio_patch_proj.weight" },
+    },
+    .threshhold = null,
+    // Matches the set ComfyUI's reference int8_convrot bake leaves unquantized: the
+    // 50 backbone blocks' qkv/out/fc1/fc2 are the target, everything else is the
+    // conditioning and IO path.
+    //
+    // token_refiner is the one entry here that is not obviously worth its size, and
+    // it is protected on the reference's authority rather than on a measurement. It
+    // is two blocks structurally identical to the 50 in the backbone, ~4% of the
+    // parameters, and its bf16 costs only 7% of an int8 safetensors file - but the
+    // GGUF path upcasts bf16 to f32, which turns it into 22% of a q4_k file. What
+    // would settle it is per-tensor damage for its eight linears against the
+    // backbone's; until then it stays protected.
+    .keys_hiprec = &.{
+        "video_patch_proj", // fp32 in the checkpoint; ComfyUI reads shape[0] for hidden_size
+        "audio_patch_proj",
+        "condition_proj", // ComfyUI reads shape[1] for text_dim
+        "adaln_t_table",
+        "rope.inv_freq",
+        "time_embedder", // absent from pruned checkpoints
+        "token_refiner",
+        "final_layer", // fp32 output heads plus their AdaLN
+    },
+    .keys_hiprec_narrow = &.{
+        .{ .key = "adaln_proj.linear.weight", .below_cols = 256 },
+    },
+    // RMSNorm scales: per-head q/k norms and the two per-block stream norms.
+    .upcast_from_bf16 = &.{
+        ".attn.q_norm.weight",
+        ".attn.k_norm.weight",
+        ".norm1.weight",
+        ".norm2.weight",
+        ".final_norm.weight",
+        "final_layer.norm.weight",
+    },
+    // NVFP4 nibble-packing halves the contiguous dimension. condition_proj.weight
+    // shape[1] is text_dim and time_embedder.proj_in.weight shape[1] is
+    // timestep_input_dim; both are already high-precision above, listed here so the
+    // requirement survives a change to that list.
+    .keys_nvfp4_passthrough = &.{
+        "condition_proj.weight",
+        "time_embedder.proj_in.weight",
+    },
+};
+
 /// List of all known architectures, in detection priority order
 pub const arch_list = [_]*const Arch{
     &flux,
@@ -611,6 +699,7 @@ pub const arch_list = [_]*const Arch{
     &qwen,
     &ernie,
     &krea2,
+    &minimax_h3,
 };
 
 /// Core matcher: names must match, and any `shape_detect` rules must hold.
@@ -994,6 +1083,87 @@ test "krea2 nvfp4 passthrough - first.weight" {
     try std.testing.expect(krea2.isNvfp4Passthrough("first.weight"));
     try std.testing.expect(krea2.isNvfp4Passthrough("model.diffusion_model.first.weight"));
     try std.testing.expect(!krea2.isNvfp4Passthrough("blocks.0.attn.wq.weight"));
+}
+
+test "detect minimax_h3 architecture" {
+    const names = [_][]const u8{
+        "video_patch_proj.weight",
+        "audio_patch_proj.weight",
+        "blocks.0.attn.qkv_proj.weight",
+    };
+    const arch = detectArch(&names);
+    try std.testing.expect(arch != null);
+    try std.testing.expectEqualStrings("minimax_h3", arch.?.name);
+    // No convolutions, so the GGUF flat-block reshape must stay off.
+    try std.testing.expect(!arch.?.shape_fix);
+}
+
+test "detect minimax_h3 architecture with prefix" {
+    const names = [_][]const u8{
+        "model.diffusion_model.video_patch_proj.weight",
+        "model.diffusion_model.audio_patch_proj.weight",
+    };
+    try std.testing.expectEqualStrings("minimax_h3", detectArch(&names).?.name);
+}
+
+test "minimax_h3 keeps the conditioning and IO path high-precision" {
+    const protected = [_][]const u8{
+        "video_patch_proj.weight",
+        "audio_patch_proj.bias",
+        "condition_proj.weight",
+        "adaln_t_table",
+        "rope.inv_freq",
+        "time_embedder.proj_in.weight",
+        "token_refiner.blocks.1.mlp.fc1.weight",
+        "token_refiner.final_norm.weight",
+        "final_layer.video_out.weight",
+        "final_layer.audio_out.weight",
+        "model.diffusion_model.final_layer.adaln_proj.linear.weight",
+    };
+    for (protected) |k| try std.testing.expect(minimax_h3.isHighPrecision(k));
+
+    // The 50 backbone blocks' four linears are the quantization target.
+    const backbone = [_][]const u8{
+        "blocks.0.attn.qkv_proj.weight",
+        "blocks.49.attn.out_proj.weight",
+        "blocks.13.mlp.fc1.weight",
+        "blocks.7.mlp.fc2.weight",
+        "model.diffusion_model.blocks.31.attn.qkv_proj.weight",
+    };
+    for (backbone) |k| try std.testing.expect(!minimax_h3.isHighPrecision(k));
+}
+
+test "minimax_h3 protects adaln_proj only in its pruned curve form" {
+    // Pruned: 8 coordinates on the shared time-embedding basis.
+    var curve = [_]usize{ 96768, 8 };
+    try std.testing.expect(minimax_h3.isNarrowHighPrecision("blocks.0.adaln_proj.linear.weight", &curve));
+
+    // Full: the time-embedding width, 13B parameters that have to stay quantizable.
+    var full = [_]usize{ 96768, 2688 };
+    try std.testing.expect(!minimax_h3.isNarrowHighPrecision("blocks.0.adaln_proj.linear.weight", &full));
+
+    // The rule is scoped to that one key, and a shapeless tensor never matches.
+    try std.testing.expect(!minimax_h3.isNarrowHighPrecision("blocks.0.mlp.fc1.weight", &curve));
+    try std.testing.expect(!minimax_h3.isNarrowHighPrecision("blocks.0.adaln_proj.linear.weight", &.{}));
+
+    // The final layer's AdaLN is already unconditionally protected, either way.
+    try std.testing.expect(minimax_h3.isHighPrecision("final_layer.adaln_proj.linear.weight"));
+}
+
+test "minimax_h3 upcasts rmsnorm scales" {
+    try std.testing.expect(minimax_h3.shouldUpcast("blocks.0.attn.q_norm.weight"));
+    try std.testing.expect(minimax_h3.shouldUpcast("blocks.49.attn.k_norm.weight"));
+    try std.testing.expect(minimax_h3.shouldUpcast("blocks.0.norm1.weight"));
+    try std.testing.expect(minimax_h3.shouldUpcast("blocks.0.norm2.weight"));
+    try std.testing.expect(minimax_h3.shouldUpcast("token_refiner.final_norm.weight"));
+    try std.testing.expect(minimax_h3.shouldUpcast("final_layer.norm.weight"));
+    try std.testing.expect(!minimax_h3.shouldUpcast("blocks.0.attn.qkv_proj.weight"));
+}
+
+test "minimax_h3 nvfp4 passthrough keeps the detected dimensions" {
+    try std.testing.expect(minimax_h3.isNvfp4Passthrough("condition_proj.weight"));
+    try std.testing.expect(minimax_h3.isNvfp4Passthrough("time_embedder.proj_in.weight"));
+    try std.testing.expect(!minimax_h3.isNvfp4Passthrough("blocks.0.mlp.fc2.weight"));
 }
 
 test "krea2 high-precision policy matches ComfyUI reference (backbone-only quant)" {

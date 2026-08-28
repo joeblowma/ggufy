@@ -853,6 +853,9 @@ fn assignTensorType(
     // High-precision tensors (e.g. norms, gates) - use nearest compatible type
     if (arch.isHighPrecision(t.name)) return nearestCompatibleType(t, opts, num_elements);
 
+    // Same, for layers that only need protecting in a narrow-row form (see NarrowRule).
+    if (arch.isNarrowHighPrecision(t.name, t.dims)) return nearestCompatibleType(t, opts, num_elements);
+
     // Apply the target datatype.
     const ttype = opts.datatype orelse return;
     if (opts.filetype == .gguf) {
@@ -1650,6 +1653,36 @@ test "assignTensorType: large 2D weights are quantized" {
     var t = types.Tensor{ .name = "blocks.0.attn.wq.weight", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
     try assignTensorType(&t, n, &imagearch.generic_arch, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
     try testing.expectEqualStrings("q8_0", t.type);
+}
+
+test "assignTensorType: minimax_h3 pruned adaln_proj is kept float, full-width is quantized" {
+    const opts = testOpts(.q4_k);
+    // 96768 * 8 = 774144 elements: 2D, well above the threshold, and divisible by
+    // the q4_k block size, so only the narrow rule can keep it float.
+    var curve = [_]usize{ 96768, 8 };
+    var t = types.Tensor{ .name = "blocks.0.adaln_proj.linear.weight", .type = "F16", .dims = &curve, .size = 0, .offset = 0 };
+    try assignTensorType(&t, 96768 * 8, &imagearch.minimax_h3, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
+    try testing.expectEqualStrings("F16", t.type);
+
+    // The unpruned form is 40% of the model's parameters and must still quantize.
+    var full = [_]usize{ 96768, 2688 };
+    var t2 = types.Tensor{ .name = "blocks.0.adaln_proj.linear.weight", .type = "BF16", .dims = &full, .size = 0, .offset = 0 };
+    try assignTensorType(&t2, 96768 * 2688, &imagearch.minimax_h3, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
+    try testing.expectEqualStrings("q4_k", t2.type);
+}
+
+test "assignTensorType: minimax_h3 backbone linears quantize, conditioning path does not" {
+    const opts = testOpts(.q4_k);
+    var dims = [_]usize{ 28672, 5376 };
+    const n: u64 = 28672 * 5376;
+    var t = types.Tensor{ .name = "blocks.0.mlp.fc1.weight", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
+    try assignTensorType(&t, n, &imagearch.minimax_h3, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
+    try testing.expectEqualStrings("q4_k", t.type);
+
+    // Same shape, inside the token refiner: protected.
+    var t2 = types.Tensor{ .name = "token_refiner.blocks.0.mlp.fc1.weight", .type = "BF16", .dims = &dims, .size = 0, .offset = 0 };
+    try assignTensorType(&t2, n, &imagearch.minimax_h3, QUANTIZATION_THRESHOLD, opts, false, null, std.testing.allocator);
+    try testing.expectEqualStrings("f32", t2.type);
 }
 
 test "isEmbeddingWeight: matches embedding tables, not embedder projections" {

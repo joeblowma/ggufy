@@ -105,6 +105,13 @@ test "krea2 (native single-file)" {
     try expectArch(@embedFile("test_fixtures/krea2.json"), "krea2");
 }
 
+// Dumped from a pruned int8_convrot bake, so the fixture still carries the
+// `.weight_scale` / `.comfy_quant` sidecars a cluster checkpoint ships with.
+// Detection runs before cluster collapse and must not care.
+test "minimax h3 (pruned int8_convrot)" {
+    try expectArch(@embedFile("test_fixtures/minimax_h3.json"), "minimax_h3");
+}
+
 // Mage-Flow's tensor names are byte-for-byte the same set as Qwen-Image's, so
 // this fixture (dumped from mageFlow_mageFlow4B.safetensors) only resolves
 // correctly because detection also checks txt_norm/proj_out dimensions.
