@@ -38,6 +38,7 @@ This table lists the architectures that ggufy can convert, and whether they have
 | Aura               | ✅         | ❌                |
 | HiDream            | ✅         | ❌                |
 | Cosmos             | ✅         | ❌                |
+| Anima              | ✅         | ❌                |
 | LTXV               | ✅         | ❌                |
 | LTX2               | ✅         | ❌                |
 | Hyvid              | ✅         | ❌                |
