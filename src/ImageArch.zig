@@ -481,7 +481,9 @@ pub const lumina2 = Arch{
 };
 
 pub const qwen = Arch{
-    .name = "qwen",
+    // "qwen_image" is the image_model string ComfyUI assigns, and the GGUF loader
+    // gates on it verbatim.
+    .name = "qwen_image",
     .keys_detect = &.{
         &.{
             "time_text_embed.timestep_embedder.linear_2.weight",
@@ -841,7 +843,7 @@ test "detect qwen architecture" {
     };
     const arch = detectArch(&names);
     try std.testing.expect(arch != null);
-    try std.testing.expectEqualStrings("qwen", arch.?.name);
+    try std.testing.expectEqualStrings("qwen_image", arch.?.name);
     try std.testing.expect(arch.?.shape_fix);
 }
 
@@ -1001,11 +1003,11 @@ test "mage_flow vs qwen-image disambiguation is by shape only" {
 
     // Qwen-Image: same names, different dims — must not be claimed by mage_flow.
     var qwen_image = mmditTensors(3584, 64);
-    try std.testing.expectEqualStrings("qwen", (try detectArchFromTensors(&qwen_image, allocator)).?.name);
+    try std.testing.expectEqualStrings("qwen_image", (try detectArchFromTensors(&qwen_image, allocator)).?.name);
 
     // One matching dimension is not enough; both rules must hold.
     var half_match = mmditTensors(2560, 64);
-    try std.testing.expectEqualStrings("qwen", (try detectArchFromTensors(&half_match, allocator)).?.name);
+    try std.testing.expectEqualStrings("qwen_image", (try detectArchFromTensors(&half_match, allocator)).?.name);
 }
 
 test "shape rules reject tensors with missing or too-few dims" {

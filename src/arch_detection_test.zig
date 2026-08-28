@@ -94,7 +94,7 @@ test "lumina2 (zib, no prefix)" {
 }
 
 test "qwen" {
-    try expectArch(@embedFile("test_fixtures/qwen.json"), "qwen");
+    try expectArch(@embedFile("test_fixtures/qwen.json"), "qwen_image");
 }
 
 test "ernie" {
@@ -131,5 +131,5 @@ test "mageflow names alone are indistinguishable from qwen-image" {
     defer allocator.free(names);
     for (parsed.value, 0..) |e, i| names[i] = e.name;
 
-    try std.testing.expectEqualStrings("qwen", imagearch.detectArch(names).?.name);
+    try std.testing.expectEqualStrings("qwen_image", imagearch.detectArch(names).?.name);
 }
