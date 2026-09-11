@@ -416,6 +416,50 @@ pub const QuantizationLevel = enum(u8) {
     }
 };
 
+/// Lift `target` to the cheapest type carrying at least `min` bits per weight,
+/// staying inside `target`'s own format family. Returns `target` unchanged when it
+/// already clears the floor, and null when the family has no rung that does - the
+/// caller then leaves the tensor at its source precision.
+///
+/// Family matters as much as the bit count here. On the GGUF side every block quant
+/// dequantizes into the same compute path, so a step is purely storage and the
+/// existing level ordering is the ladder. On the SafeTensors side each cluster type
+/// is bound to a different ComfyUI kernel, so the step has to land on the sibling
+/// that shares the rotation and scale layout rather than on whatever is cheapest.
+pub fn liftToFloor(target: types.DataType, min: imagearch.Precision) ?types.DataType {
+    const want = @intFromEnum(min);
+    if (target.nominalBits() >= want) return target;
+
+    return switch (target) {
+        // Rotated-int cluster line: the 8-bit rung keeps the Hadamard rotation and
+        // the per-row scale, so only the element width changes.
+        .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8 => if (want <= 8) .INT8_CONVROT else null,
+        // Block-scaled FP line. Both lift to MXFP8 rather than to SCALED_F8_E4M3,
+        // which is also 8-bit and slightly smaller: scaled-fp8 carries a single F32
+        // for the whole tensor, so it would buy four bits of element precision while
+        // throwing away the per-block scaling. On a tensor that is floored precisely
+        // because its activations have outliers, that is the wrong half to give up -
+        // one tensor-wide scale is set by the outliers and everything under them
+        // loses resolution. MXFP8 keeps a scale per 32 elements.
+        .NVFP4, .MXFP4 => if (want <= 8) .MXFP8_E4M3 else null,
+        // GGUF: walk the existing level ordering upward, keeping to the families the
+        // requested type already implies (q8_0 and the float types are always in).
+        else => blk: {
+            if (target.formatType() != .gguf) break :blk null;
+            const families = QuantizationFamilies.fromDataType(target);
+            const start = QuantizationLevel.fromString(@tagName(target)) catch break :blk null;
+            var i: u8 = @intFromEnum(start) + 1;
+            while (i <= @intFromEnum(QuantizationLevel.f64)) : (i += 1) {
+                const cand: QuantizationLevel = @enumFromInt(i);
+                if (!families.allows(cand)) continue;
+                const dt = types.DataType.fromString(@tagName(cand)) catch continue;
+                if (dt.nominalBits() >= want) break :blk dt;
+            }
+            break :blk null;
+        },
+    };
+}
+
 /// Calculate an appropriate quantization level for one tensor given its
 /// sensitivity score and the user's aggressiveness setting.
 ///
@@ -856,8 +900,18 @@ fn assignTensorType(
     // Same, for layers that only need protecting in a narrow-row form (see NarrowRule).
     if (arch.isNarrowHighPrecision(t.name, t.dims)) return nearestCompatibleType(t, opts, num_elements);
 
-    // Apply the target datatype.
-    const ttype = opts.datatype orelse return;
+    // Apply the target datatype, lifted to any precision floor this architecture
+    // declares for the tensor. The floor sits ahead of every format branch, so it
+    // holds for GGUF and SafeTensors alike and neither `-a` nor `-x` can undo it.
+    var ttype = opts.datatype orelse return;
+    if (arch.precisionFloor(t.name)) |min| {
+        const lifted = liftToFloor(ttype, min) orelse
+            return nearestCompatibleType(t, opts, num_elements);
+        if (lifted != ttype) {
+            std.log.info("Precision floor: {s} {s} -> {s}", .{ t.name, @tagName(ttype), @tagName(lifted) });
+            ttype = lifted;
+        }
+    }
     if (opts.filetype == .gguf) {
         const ggml_type = gguf.GgmlType.fromString(@tagName(ttype)) catch unreachable;
         const bs = ggml_type.getBlockSize();
@@ -1839,4 +1893,90 @@ test "datatypeFitsFiletype accepts cross-format equivalents and rejects the rest
     for ([_]types.DataType{ .SCALED_F8_E4M3, .INT8, .INT8_CONVROT, .INT4_CONVROT, .NVFP4, .MXFP4, .MXFP8_E4M3, .F8_E4M3 }) |dt| {
         try testing.expect(!datatypeFitsFiletype(dt, .gguf));
     }
+}
+
+
+test "liftToFloor stays inside the requested format's family" {
+    const F = imagearch.Precision;
+    // Rotated-int cluster line keeps its rotation and per-row scale at 8 bits.
+    try testing.expectEqual(types.DataType.INT8_CONVROT, liftToFloor(.INT4_CONVROT, F.bits8).?);
+    try testing.expectEqual(types.DataType.INT8_CONVROT, liftToFloor(.INT4_CONVROT_SR, F.bits8).?);
+    try testing.expectEqual(types.DataType.INT8_CONVROT, liftToFloor(.ASYM_W4A8_INT8, F.bits8).?);
+    // Float lines step to their own siblings, not to an int format.
+    try testing.expectEqual(types.DataType.MXFP8_E4M3, liftToFloor(.NVFP4, F.bits8).?);
+    try testing.expectEqual(types.DataType.MXFP8_E4M3, liftToFloor(.MXFP4, F.bits8).?);
+    // GGUF walks the existing level ordering. q8_0 is the first rung at 8 bits.
+    try testing.expectEqual(types.DataType.q8_0, liftToFloor(.q4_k, F.bits8).?);
+    try testing.expectEqual(types.DataType.q6_k, liftToFloor(.q4_k, F.bits6).?);
+    try testing.expectEqual(types.DataType.q5_k, liftToFloor(.q4_k, F.bits5).?);
+    // A target already at or above the floor is returned untouched.
+    try testing.expectEqual(types.DataType.INT8_CONVROT, liftToFloor(.INT8_CONVROT, F.bits8).?);
+    try testing.expectEqual(types.DataType.q8_0, liftToFloor(.q8_0, F.bits8).?);
+    // No cluster line carries 16 bits, so the caller falls back to the source dtype.
+    try testing.expect(liftToFloor(.INT4_CONVROT, F.bits16) == null);
+    try testing.expect(liftToFloor(.NVFP4, F.bits16) == null);
+}
+
+test "assignTensorType: sensenova_u15 floors down_proj on every output path" {
+    testing.log_level = .err; // the floor logs each lift at info level
+
+    const dims = [_]usize{ 4096, 12288 };
+    const n: u64 = 4096 * 12288;
+    const Case = struct { target: types.DataType, filetype: types.FileType, want: []const u8 };
+    const cases = [_]Case{
+        .{ .target = .q4_k, .filetype = .gguf, .want = "q8_0" },
+        .{ .target = .q2_k, .filetype = .gguf, .want = "q8_0" },
+        .{ .target = .INT4_CONVROT, .filetype = .safetensors, .want = "INT8_CONVROT" },
+        .{ .target = .NVFP4, .filetype = .safetensors, .want = "MXFP8_E4M3" },
+        .{ .target = .ASYM_W4A8_INT8, .filetype = .safetensors, .want = "INT8_CONVROT" },
+        // Already at the floor: must pass through untouched, not get lifted again.
+        .{ .target = .INT8_CONVROT, .filetype = .safetensors, .want = "INT8_CONVROT" },
+    };
+
+    // The cluster size path allocates sub-tensor specs expecting an arena teardown.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (cases) |c| {
+        var opts = testOpts(c.target);
+        opts.filetype = c.filetype;
+
+        var t = types.Tensor{
+            .name = "language_model.model.layers.0.mlp.down_proj.weight",
+            .type = "BF16",
+            .dims = @constCast(dims[0..]),
+            .size = 0,
+            .offset = 0,
+        };
+        try assignTensorType(&t, n, &imagearch.sensenova_u15, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        try testing.expectEqualStrings(c.want, t.type);
+
+        // The MoT twin is measured fine at the target and must not be lifted: the
+        // substring "mlp.down_proj" does not occur in "mlp_mot_gen.down_proj".
+        var twin = types.Tensor{
+            .name = "language_model.model.layers.0.mlp_mot_gen.down_proj.weight",
+            .type = "BF16",
+            .dims = @constCast(dims[0..]),
+            .size = 0,
+            .offset = 0,
+        };
+        try assignTensorType(&twin, n, &imagearch.sensenova_u15, QUANTIZATION_THRESHOLD, opts, false, null, a);
+        try testing.expectEqualStrings(@tagName(c.target), twin.type);
+    }
+}
+
+test "precision floors do not touch architectures that declare none" {
+    testing.log_level = .err;
+    const dims = [_]usize{ 4096, 12288 };
+    const n: u64 = 4096 * 12288;
+    var t = types.Tensor{
+        .name = "language_model.model.layers.0.mlp.down_proj.weight",
+        .type = "BF16",
+        .dims = @constCast(dims[0..]),
+        .size = 0,
+        .offset = 0,
+    };
+    try assignTensorType(&t, n, &imagearch.krea2, QUANTIZATION_THRESHOLD, testOpts(.q4_k), false, null, std.testing.allocator);
+    try testing.expectEqualStrings("q4_k", t.type);
 }

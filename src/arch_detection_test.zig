@@ -133,3 +133,8 @@ test "mageflow names alone are indistinguishable from qwen-image" {
 
     try std.testing.expectEqualStrings("qwen_image", imagearch.detectArch(names).?.name);
 }
+
+// Dumped from a bf16 single-file checkpoint.
+test "sensenova u1.5 8B MoT" {
+    try expectArch(@embedFile("test_fixtures/sensenova_u15.json"), "sensenova_u15");
+}

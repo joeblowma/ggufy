@@ -25,6 +25,27 @@ pub const NarrowRule = struct {
     below_cols: usize,
 };
 
+/// Minimum precision a tensor may be stored at, as a bits-per-weight class.
+/// Deliberately not a concrete type: an architecture knows a layer needs more
+/// bits, not which of the six 4-bit formats someone will ask for. The output
+/// family is inherited from the requested type (see Convert.liftToFloor).
+pub const Precision = enum(u8) {
+    bits4 = 4,
+    bits5 = 5,
+    bits6 = 6,
+    bits8 = 8,
+    bits16 = 16,
+};
+
+/// A tensor that breaks below some precision, whatever format is requested.
+/// Unlike `keys_hiprec` this does not jump to the source dtype - it lifts to the
+/// cheapest rung of the requested format's own family that clears the floor.
+pub const PrecisionFloor = struct {
+    /// Tensor name substring, matched the same way `keys_hiprec` is.
+    key: []const u8,
+    min: Precision,
+};
+
 /// Represents a model architecture with its detection keys and configuration
 pub const Arch = struct {
     /// String describing architecture name
@@ -45,6 +66,10 @@ pub const Arch = struct {
     keys_hiprec: []const []const u8 = &.{},
     /// Keys kept high-precision only in their narrow form (see NarrowRule)
     keys_hiprec_narrow: []const NarrowRule = &.{},
+    /// Tensors that must not be stored below a given precision (see PrecisionFloor).
+    /// Applied to the target type before any format branch, so it holds on every
+    /// output path and is unaffected by `-a` or `-x`.
+    precision_floor: []const PrecisionFloor = &.{},
     /// Key substrings to ignore when found
     keys_ignore: []const []const u8 = &.{},
     /// Quantization threshhold specific to a model, or fall back to default
@@ -110,6 +135,18 @@ pub const Arch = struct {
             if (cols < rule.below_cols and std.mem.indexOf(u8, key, rule.key) != null) return true;
         }
         return false;
+    }
+
+    /// The strictest precision floor declared for this key, or null if none apply.
+    pub fn precisionFloor(self: Arch, key: []const u8) ?Precision {
+        var strictest: ?Precision = null;
+        for (self.precision_floor) |rule| {
+            if (std.mem.indexOf(u8, key, rule.key) == null) continue;
+            if (strictest == null or @intFromEnum(rule.min) > @intFromEnum(strictest.?)) {
+                strictest = rule.min;
+            }
+        }
+        return strictest;
     }
 
     /// Check if a key should be ignored
@@ -682,6 +719,93 @@ pub const minimax_h3 = Arch{
     },
 };
 
+// SenseNova U1.5: a Mixture-of-Transformers unified model. One Qwen2-shaped
+// backbone (42 layers, 4096 hidden, 12288 FFN, 32 heads over 8 KV heads) holds
+// every attention and MLP weight twice - a bare copy that encodes the prompt and
+// any reference images into a prefix KV cache, and a `_mot_gen` copy that
+// denoises. Both branches are the model and both quantize; together they are
+// 16.2B of its 17.5B parameters. It denoises pixels directly, so a checkpoint
+// carries no VAE and no separate text encoder, and its keys sit at the top level
+// with no `model.diffusion_model.` prefix.
+//
+// `sensenova_u15` is the `image_model` string ComfyUI assigns, used verbatim as
+// `general.architecture`.
+//
+// ComfyUI additionally guards detection on two dimensions (patch_embedding rows
+// 1024, q_proj_mot_gen rows 4096) because it is picking one branch of a long
+// if-else. We match on names alone: nothing else here has a `_mot_gen` anything,
+// and a `shape_detect` would make this arch unreachable from the name-only
+// entry points. A larger MoT variant would therefore be labelled u1.5 and then
+// rejected by ComfyUI's own shape guard, which is the right place to fail.
+//
+// The whole conditioning and pixel IO path is kept high-precision: both vision
+// encoders, the timestep and noise-scale embedders, and the fm_head decoder.
+// That is everything outside the backbone bar the token embedding, and it is
+// 81M parameters - 0.46% of the model - so it is the same trade the mageflow
+// and minimax_h3 entries make. `fm_modules.` covers the generation-side vision
+// encoder, both embedders and fm_head; `vision_model.` covers the prefix-side
+// encoder (the underscore in `vision_model_mot_gen` keeps the two disjoint).
+//
+// `language_model.lm_head.weight` is deliberately NOT ignored. ComfyUI pops it
+// because its module tree has no such attribute and it never samples a token -
+// the prompt template hardcodes an empty <think> block and walks straight into
+// <img>. Keeping it costs ~350 MB at q4_k and leaves the checkpoint able to do
+// the text half of the model. `model.norm` (as against `norm_mot_gen`) is dead
+// for the same reason and kept for the same reason.
+pub const sensenova_u15 = Arch{
+    .name = "sensenova_u15",
+    // Conv weights flatten to a contiguous extent of 2 or 3 (dense_embedding,
+    // fm_head), which ggml will not accept as ne[0] for a block-quantized
+    // tensor. ComfyUI-GGUF restores the logical shape from the recorded
+    // orig_shape before it reads either detection dimension.
+    .shape_fix = true,
+    .keys_detect = &.{
+        &.{
+            "fm_modules.vision_model_mot_gen.embeddings.patch_embedding.weight",
+            "language_model.model.layers.0.self_attn.q_proj_mot_gen.weight",
+        },
+    },
+    .keys_hiprec = &.{
+        "fm_modules.",
+        "vision_model.",
+    },
+    .threshhold = null,
+    // At q4_k this model renders a clean image with no relation to the prompt: the
+    // prefix pass IS the conditioning, and `mlp.down_proj` alone destroys it by
+    // layer 5 (taking just that weight dense lifts the 42-layer KV cosine from 0.45
+    // to 0.988; every other weight kind moves it by under 0.04). It contracts over
+    // the 12288-wide SiLU-gated hidden where the activation outliers live, which is
+    // why llama.cpp's k-quant mixes upgrade `ffn_down` too.
+    //
+    // Base copy only: the `_mot_gen` tower sits at cosine 0.9889 on a fixed prefix
+    // and taking its `down_proj` dense moves that by 0.0002, so the sensitivity is
+    // the deep causal text pass rather than the layer's shape. The substring keeps
+    // the two apart on its own - `mlp_mot_gen.down_proj` does not contain `mlp.`.
+    .precision_floor = &.{
+        .{ .key = "mlp.down_proj", .min = .bits8 },
+    },
+    // RMSNorm scales: each branch's per-head q/k norms (over half a head_dim,
+    // split again for the h/w rope halves), its two per-block stream norms, and
+    // the backbone's two final norms. Every one sits under the size threshold,
+    // so a bf16 source reaches f32 without this; it bites on an f16 repack.
+    .upcast_from_bf16 = &.{
+        ".q_norm.weight",
+        ".q_norm_mot_gen.weight",
+        ".q_norm_hw.weight",
+        ".q_norm_hw_mot_gen.weight",
+        ".k_norm.weight",
+        ".k_norm_mot_gen.weight",
+        ".k_norm_hw.weight",
+        ".k_norm_hw_mot_gen.weight",
+        ".input_layernorm.weight",
+        ".input_layernorm_mot_gen.weight",
+        ".post_attention_layernorm.weight",
+        ".post_attention_layernorm_mot_gen.weight",
+        ".model.norm.weight",
+        ".model.norm_mot_gen.weight",
+    },
+};
+
 /// List of all known architectures, in detection priority order
 pub const arch_list = [_]*const Arch{
     &flux,
@@ -702,6 +826,7 @@ pub const arch_list = [_]*const Arch{
     &ernie,
     &krea2,
     &minimax_h3,
+    &sensenova_u15,
 };
 
 /// Core matcher: names must match, and any `shape_detect` rules must hold.
@@ -1193,4 +1318,69 @@ test "krea2 high-precision policy matches ComfyUI reference (backbone-only quant
         "model.diffusion_model.blocks.9.mlp.gate.weight",
     };
     for (backbone) |k| try std.testing.expect(!krea2.isHighPrecision(k));
+}
+test "sensenova_u15 detection needs both MoT discriminators" {
+    const full = [_][]const u8{
+        "fm_modules.vision_model_mot_gen.embeddings.patch_embedding.weight",
+        "fm_modules.fm_head.conv1.weight",
+        "language_model.model.embed_tokens.weight",
+        "language_model.model.layers.0.self_attn.q_proj_mot_gen.weight",
+        "language_model.model.layers.0.mlp.gate_proj.weight",
+        "vision_model.embeddings.patch_embedding.weight",
+    };
+    try std.testing.expectEqualStrings("sensenova_u15", detectArch(&full).?.name);
+
+    // The vision encoder alone is not enough: a plain VLM has one too.
+    const no_gen_branch = [_][]const u8{
+        "fm_modules.vision_model_mot_gen.embeddings.patch_embedding.weight",
+        "language_model.model.layers.0.self_attn.q_proj.weight",
+    };
+    try std.testing.expect(detectArch(&no_gen_branch) == null);
+}
+
+test "sensenova_u15 protects the IO path and quantizes both MoT branches" {
+    const protected = [_][]const u8{
+        "vision_model.embeddings.patch_embedding.weight",
+        "vision_model.embeddings.dense_embedding.weight",
+        "fm_modules.vision_model_mot_gen.embeddings.dense_embedding.weight",
+        "fm_modules.timestep_embedder.mlp.0.weight",
+        "fm_modules.noise_scale_embedder.mlp.2.weight",
+        "fm_modules.fm_head.conv1.weight",
+        "fm_modules.fm_head.conv2.weight",
+    };
+    for (protected) |k| try std.testing.expect(sensenova_u15.isHighPrecision(k));
+
+    // Both copies of every backbone weight are the model, and both quantize.
+    const backbone = [_][]const u8{
+        "language_model.model.layers.0.self_attn.q_proj.weight",
+        "language_model.model.layers.0.self_attn.q_proj_mot_gen.weight",
+        "language_model.model.layers.41.self_attn.o_proj_mot_gen.weight",
+        "language_model.model.layers.20.mlp.down_proj.weight",
+        "language_model.model.layers.20.mlp_mot_gen.down_proj.weight",
+        "language_model.lm_head.weight",
+    };
+    for (backbone) |k| try std.testing.expect(!sensenova_u15.isHighPrecision(k));
+}
+
+test "sensenova_u15 upcasts every RMSNorm scale of both branches" {
+    const scales = [_][]const u8{
+        "language_model.model.layers.0.self_attn.q_norm.weight",
+        "language_model.model.layers.0.self_attn.q_norm_mot_gen.weight",
+        "language_model.model.layers.0.self_attn.q_norm_hw.weight",
+        "language_model.model.layers.0.self_attn.q_norm_hw_mot_gen.weight",
+        "language_model.model.layers.7.self_attn.k_norm.weight",
+        "language_model.model.layers.7.self_attn.k_norm_mot_gen.weight",
+        "language_model.model.layers.7.self_attn.k_norm_hw.weight",
+        "language_model.model.layers.7.self_attn.k_norm_hw_mot_gen.weight",
+        "language_model.model.layers.3.input_layernorm.weight",
+        "language_model.model.layers.3.input_layernorm_mot_gen.weight",
+        "language_model.model.layers.3.post_attention_layernorm.weight",
+        "language_model.model.layers.3.post_attention_layernorm_mot_gen.weight",
+        "language_model.model.norm.weight",
+        "language_model.model.norm_mot_gen.weight",
+    };
+    for (scales) |k| try std.testing.expect(sensenova_u15.shouldUpcast(k));
+
+    try std.testing.expect(!sensenova_u15.shouldUpcast("language_model.model.layers.3.mlp.up_proj.weight"));
+    try std.testing.expect(!sensenova_u15.shouldUpcast("language_model.model.embed_tokens.weight"));
 }

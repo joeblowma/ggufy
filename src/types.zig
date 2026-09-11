@@ -183,6 +183,27 @@ pub const DataType = enum {
         };
     }
 
+    /// Nominal bits per weight for the format, ignoring per-tensor scale overhead.
+    pub fn nominalBits(self: DataType) u8 {
+        return switch (self) {
+            .q1_0, .iq1_s, .iq1_m => 1,
+            .q2_k, .iq2_xxs, .iq2_xs, .iq2_s, .tq1_0, .tq2_0 => 2,
+            .q3_k, .iq3_xxs, .iq3_s => 3,
+            .F4_E2M1, .MXFP4, .NVFP4, .INT4_CONVROT, .INT4_CONVROT_SR, .ASYM_W4A8_INT8 => 4,
+            .q4_0, .q4_1, .q4_2, .q4_3, .q4_k, .mxfp4, .nvfp4 => 4,
+            .iq4_nl, .iq4_xs, .iq4_nl_4_4, .iq4_nl_4_8, .iq4_nl_8_8 => 4,
+            .q4_0_4_4, .q4_0_4_8, .q4_0_8_8 => 4,
+            .q5_0, .q5_1, .q5_k => 5,
+            .q6_k => 6,
+            .F8_E4M3, .F8_E5M2, .SCALED_F8_E4M3, .MXFP8_E4M3, .INT8, .INT8_CONVROT => 8,
+            .I8, .U8, .i8, .q8_0, .q8_1, .q8_k => 8,
+            .BF16, .F16, .I16, .U16, .bf16, .f16, .i16 => 16,
+            .F32, .I32, .U32, .f32, .i32 => 32,
+            .F64, .I64, .U64, .f64, .i64 => 64,
+            .count => 0,
+        };
+    }
+
     pub fn calcSizeInBytes(self: DataType, n_elements: u64) u64 {
         // SCALED_F8_E4M3 and INT8_CONVROT are cluster types; actual total size is set by
         // assignQuantType. Report just the weight bytes (1 per element) as a conservative
