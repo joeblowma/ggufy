@@ -543,6 +543,40 @@ pub const qwen = Arch{
     },
 };
 
+// qwen image 2.1 is the same as qwen image with one change
+pub const qwen21 = Arch{
+    // "qwen_image" is the image_model string ComfyUI assigns, and the GGUF loader
+    // gates on it verbatim.
+    .name = "qwen_image21",
+    .keys_detect = &.{
+        &.{
+            "txt_in.text_norm.weight", // this is the one main difference
+            "time_text_embed.timestep_embedder.linear_2.weight",
+        },
+    },
+    .shape_fix = true,
+    .threshhold = null,
+    .keys_hiprec = &.{
+        "text_norm.weight",
+        "img_in.",
+        "txt_in.",
+        "proj_out.",
+        "norm_out.linear",
+        "time_text_embed",
+        "modulation.",
+    },
+    .upcast_from_bf16 = &.{
+        ".norm_k.weight",
+        ".norm_q.weight",
+        ".norm_added_k.weight",
+        ".norm_added_q.weight",
+    },
+    // ComfyUI infers in_channels from img_in.weight.shape[1]; NVFP4 packing halves it.
+    .keys_nvfp4_passthrough = &.{
+        "img_in.weight",
+    },
+};
+
 // Mage-Flow (microsoft/Mage) is a 12-layer native-resolution MMDiT that reuses
 // Qwen-Image's double-stream block verbatim. Its state dict has *exactly* the
 // same set of tensor names as Qwen-Image — only the dimensions differ — so name
@@ -821,6 +855,7 @@ pub const arch_list = [_]*const Arch{
     &sdxl,
     &sd1,
     &lumina2,
+    &qwen21,
     &mageflow,
     &qwen,
     &ernie,
@@ -972,6 +1007,21 @@ test "detect qwen architecture" {
     try std.testing.expect(arch.?.shape_fix);
 }
 
+test "detect qwen 2.1 architecture" {
+    // this will match flux as well, but has a banned key, so it should skip flux and match qwen
+    const names = [_][]const u8{
+        "txt_in.text_norm.weight",
+        "time_text_embed.timestep_embedder.linear_2.weight",
+        "proj_out.weight",
+        "transformer_blocks.0.img_mlp.out.weight",
+        "transformer_blocks.0.attn.to_k.weight",
+    };
+    const arch = detectArch(&names);
+    try std.testing.expect(arch != null);
+    try std.testing.expectEqualStrings("qwen_image21", arch.?.name);
+    try std.testing.expect(arch.?.shape_fix);
+}
+
 test "detect architecture from tensors with allocator" {
     const allocator = std.testing.allocator;
     const tensors = [_]types.Tensor{
@@ -1071,6 +1121,26 @@ test "qwen upcast from bf16 - no false positives" {
     try std.testing.expect(!qwen.shouldUpcast("some.other.weight"));
     try std.testing.expect(!qwen.shouldUpcast("norm_k.weight.extra")); // suffix only, not contains
 }
+
+test "qwen21 upcast from bf16 - exact match" {
+    try std.testing.expect(qwen21.shouldUpcast("text_norm.weight"));
+    try std.testing.expect(!qwen21.shouldUpcast("txt_norm.bias"));
+    try std.testing.expect(!qwen21.shouldUpcast("some.txt_norm.weight")); // not exact
+}
+
+test "qwen21 upcast from bf16 - suffix match" {
+    try std.testing.expect(qwen21.shouldUpcast("transformer_blocks.0.attn.norm_k.weight"));
+    try std.testing.expect(qwen21.shouldUpcast("transformer_blocks.5.attn.norm_q.weight"));
+    try std.testing.expect(qwen21.shouldUpcast("transformer_blocks.0.attn.norm_added_k.weight"));
+    try std.testing.expect(qwen21.shouldUpcast("transformer_blocks.0.attn.norm_added_q.weight"));
+}
+
+test "qwen21 upcast from bf16 - no false positives" {
+    try std.testing.expect(!qwen21.shouldUpcast("transformer_blocks.0.attn.norm_k.bias"));
+    try std.testing.expect(!qwen21.shouldUpcast("some.other.weight"));
+    try std.testing.expect(!qwen21.shouldUpcast("norm_k.weight.extra")); // suffix only, not contains
+}
+
 
 test "detect ltxv v1 architecture" {
     const names = [_][]const u8{
