@@ -138,3 +138,32 @@ test "mageflow names alone are indistinguishable from qwen-image" {
 test "sensenova u1.5 8B MoT" {
     try expectArch(@embedFile("test_fixtures/sensenova_u15.json"), "sensenova_u15");
 }
+
+// Dumped from llama.cpp GGUF files on disk (native tensor names).
+test "llama 24B GGUF-native" {
+    try expectArch(@embedFile("test_fixtures/llama.json"), "llama");
+}
+
+test "qwen3 32B GGUF-native" {
+    try expectArch(@embedFile("test_fixtures/qwen3.json"), "qwen3");
+}
+
+test "qwen35 9B hybrid GGUF-native" {
+    try expectArch(@embedFile("test_fixtures/qwen35.json"), "qwen35");
+}
+
+test "qwen35 35B-A3B MoE GGUF-native" {
+    try expectArch(@embedFile("test_fixtures/qwen35moe.json"), "qwen35moe");
+}
+
+// A two-block, eight-expert Qwen3MoeForCausalLM from transformers, and the GGUF
+// this tool writes from it: the real models differ only in counts.
+test "qwen3moe HF and GGUF-native" {
+    try expectArch(@embedFile("test_fixtures/qwen3moe.hf.json"), "qwen3moe");
+    try expectArch(@embedFile("test_fixtures/qwen3moe.json"), "qwen3moe");
+}
+
+// A Qwen3VLModel text encoder: the towers at the top level, not under model.
+test "qwen3vl 4B HF" {
+    try expectArch(@embedFile("test_fixtures/qwen3vl.hf.json"), "qwen3vl");
+}

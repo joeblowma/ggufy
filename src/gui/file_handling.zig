@@ -93,6 +93,23 @@ pub fn sensitivityFileCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]co
     pushWakeupEvent(state);
 }
 
+// Imatrix file dialog callback
+
+pub fn imatrixFileCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
+    const state: *guiState.State = @ptrCast(@alignCast(userdata));
+    state.imatrix_dialog_open = false;
+
+    const files = filelist orelse return;
+    if (files[0] == null) return;
+
+    const path = std.mem.span(files[0]);
+    const len = @min(path.len, state.imatrix_path_buf.len - 1);
+    @memcpy(state.imatrix_path_buf[0..len], path[0..len]);
+    state.imatrix_path_buf[len] = 0;
+    state.imatrix_path = state.imatrix_path_buf[0..len];
+    pushWakeupEvent(state);
+}
+
 // Template file dialog callback
 
 pub fn templateFileCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
@@ -297,6 +314,9 @@ pub fn buildConvertOptions(state: *guiState.State) conv.ConvertOptions {
         .allow_unknown_arch = state.allow_unknown_arch,
         .allow_upscale = state.allow_upscale,
         .arch_override = state.archOverride(),
+        .hf_names = state.hf_names,
+        .force = state.force,
+        .imatrix_path = state.imatrix_path,
     };
 }
 
@@ -305,6 +325,12 @@ pub fn buildConvertOptions(state: *guiState.State) conv.ConvertOptions {
 /// pipeline the real conversion uses. Returns null if the size can't be determined
 /// (e.g. no data type selected, or an unrecognized architecture without override).
 pub fn predictSize(alloc: std.mem.Allocator, state: *guiState.State) ?u64 {
+    // The prediction runs the real pipeline, so it is also where the UI learns
+    // that this checkpoint's pre-tokenizer has no llama.cpp tag. Only a run with
+    // the override off can clear that: allow_unknown_arch is what gets the
+    // prediction past the refusal, and it is ticked in the very box the flag
+    // draws, so clearing it here would erase the box and the checkbox with it.
+    if (!state.allow_unknown_arch) state.pretok_unknown = false;
     if (state.file_selected == null or state.target_dtype == null) return null;
     const path = state.file_selected.?;
 
@@ -324,12 +350,18 @@ pub fn predictSize(alloc: std.mem.Allocator, state: *guiState.State) ?u64 {
         .safetensors => {
             var f = ggufy.safetensor.init(path, state.io, alloc, pa, false, false) catch return null;
             defer f.deinit();
-            return conv.predictOutputSize(&f, opts, alloc, pa) catch null;
+            return conv.predictOutputSize(&f, opts, alloc, pa) catch |e| {
+                state.pretok_unknown = e == error.UnknownPretokenizer;
+                return null;
+            };
         },
         .gguf => {
             var f = ggufy.gguf.init(path, state.io, alloc, pa, false) catch return null;
             defer f.deinit();
-            return conv.predictOutputSize(&f, opts, alloc, pa) catch null;
+            return conv.predictOutputSize(&f, opts, alloc, pa) catch |e| {
+                state.pretok_unknown = e == error.UnknownPretokenizer;
+                return null;
+            };
         },
     }
 }
@@ -349,7 +381,7 @@ pub fn convertFile(alloc: std.mem.Allocator, arena_alloc: std.mem.Allocator, sta
     };
 
     // Compute output path for display after completion.
-    const output_path_str = conv.computeOutputPath(opts, arena_alloc) catch |err| {
+    const output_path_str = conv.computeOutputPath(opts, false, arena_alloc) catch |err| {
         state.convert_error = err;
         state.convert_state.store(.err, .release);
         pushWakeupEvent(state);

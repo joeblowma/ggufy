@@ -43,9 +43,19 @@ pub const State = struct {
     skip_sensitivity: bool = false,
     model_only: bool = false,
     allow_unknown_arch: bool = false,
+    /// Set by the size prediction: this LLM's pre-tokenizer matches no llama.cpp
+    /// tag, which allow_unknown_arch is what gets past.
+    pretok_unknown: bool = false,
     /// Free-form architecture name to write as `general.architecture` in GGUF output.
     /// Null-terminated; empty string means "use auto-detected name".
     arch_override_buf: [64]u8 = std.mem.zeroes([64]u8),
+    /// -H: HF names in the output, and for safetensors the HF sidecars beside it.
+    hf_names: bool = false,
+    /// -F: with hf_names, overwrite sidecars already in the output folder.
+    force: bool = false,
+    imatrix_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
+    imatrix_path: ?[]u8 = null,
+    imatrix_dialog_open: bool = false,
     sensitivity_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
     sensitivity_path: ?[]u8 = null,
     template_path_buf: [std.fs.max_path_bytes]u8 = std.mem.zeroes([std.fs.max_path_bytes]u8),
@@ -156,6 +166,10 @@ pub const State = struct {
         std.hash.autoHash(&h, self.model_only);
         std.hash.autoHash(&h, self.allow_unknown_arch);
         std.hash.autoHash(&h, self.allow_upscale);
+        // -H changes which tensors are written and under what names; an
+        // imatrix decides whether an iq type can be encoded at all.
+        std.hash.autoHash(&h, self.hf_names);
+        if (self.imatrix_path) |p| h.update(p);
         h.update(std.mem.sliceTo(&self.arch_override_buf, 0));
         if (self.template_path) |p| h.update(p);
         if (self.sensitivity_path) |p| h.update(p);

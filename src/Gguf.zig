@@ -22,7 +22,29 @@ data_offset: u64 = 0,
 /// Set equal to data_offset after init; lets Gguf satisfy the source duck-type
 /// used by saveWithSTData (offset + current_data_begin = absolute file position).
 current_data_begin: u64 = 0,
+/// Per-column importance weights, consulted by output tensor name. Null leaves
+/// every quantizer on its unweighted path, which is what the golden fixtures pin.
+imatrix: ?types.ImatrixLookup = null,
 file_size: u64 = 0,
+
+/// See the same field on Safetensor: marks this handle's tensors as already
+/// renamed to HF state-dict names by a previous `prepareConversion` pass.
+hf_names_applied: bool = false,
+
+/// See the same field on Safetensor. Never set here (only a safetensors source
+/// is renamed to native names), but the rename is compiled for both handles.
+native_names_applied: bool = false,
+
+/// A second GGUF read through this handle, an mmproj beside a text model. Its
+/// tensors are in `tensors` too, marked by `source_path` naming it.
+companion: ?Companion = null,
+
+pub const Companion = struct {
+    path: []const u8,
+    file: std.Io.File,
+    data_offset: u64,
+    metadata: std.json.ObjectMap,
+};
 
 pub const formatType = types.FileType.gguf;
 
@@ -43,7 +65,7 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
                 file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
                 is_new_file = true;
             } else {
-                    file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+                file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
             }
         }
     }
@@ -184,14 +206,43 @@ pub fn init(path: []const u8, io: std.Io, mem_allocator: std.mem.Allocator, aren
 
 pub fn deinit(self: *Gguf) void {
     self.file.close(self.io);
+    if (self.companion) |c| c.file.close(self.io);
     // tensors info and metadata use arena allocation, so freeing them specifically is not needed
 }
 
-/// Satisfies the duck-typed source interface used by saveWithSTData.
-/// GGUF is never sharded, so every tensor lives in the same file.
-/// After this call, current_data_begin is data_offset (unchanged).
-pub fn openFileForTensor(self: *Gguf, _: []const u8) !std.Io.File {
+/// Satisfies the duck-typed source interface used by saveWithSTData, and sets
+/// current_data_begin for whichever file holds `name`.
+pub fn openFileForTensor(self: *Gguf, name: []const u8) !std.Io.File {
+    const c = self.companion orelse return self.file;
+    for (self.tensors.items) |t| {
+        if (!std.mem.eql(u8, t.name, name)) continue;
+        if (t.source_path) |sp| if (std.mem.eql(u8, sp, c.path)) {
+            self.current_data_begin = c.data_offset;
+            return c.file;
+        };
+        break;
+    }
+    self.current_data_begin = self.data_offset;
     return self.file;
+}
+
+/// Read the GGUF at `path` through this handle as well: its tensors join
+/// `tensors` with `source_path` set to `path`. A name both files carry would
+/// make every read of it ambiguous, so that refuses.
+pub fn attachCompanion(self: *Gguf, path: []const u8) !void {
+    if (self.companion != null) return error.CompanionAlreadyAttached;
+    var other = try Gguf.init(path, self.io, self.allocator, self.arena_alloc, false);
+    errdefer other.file.close(self.io);
+    for (other.tensors.items) |t| for (self.tensors.items) |mine| {
+        if (std.mem.eql(u8, t.name, mine.name)) {
+            std.log.err("{s} and {s} both carry a tensor named {s}", .{ self.path, path, t.name });
+            return error.CompanionNameClash;
+        }
+    };
+    const owned = try self.arena_alloc.dupe(u8, path);
+    for (other.tensors.items) |*t| t.source_path = owned;
+    try self.tensors.appendSlice(self.arena_alloc, other.tensors.items);
+    self.companion = .{ .path = owned, .file = other.file, .data_offset = other.data_offset, .metadata = other.metadata };
 }
 
 /// Returns source metadata as an optional, matching the SafeTensors convention.
@@ -267,8 +318,12 @@ pub const GgmlType = enum(u32) {
     }
 
     pub fn fromString(value: []const u8) !GgmlType {
+        // Longer than any name in this enum is simply not one of them. Without
+        // this, lowerString asserts and takes the process down - and callers
+        // hand it safetensors type names (INT4_CONVROT_SR) that are longer.
         var lower: [12]u8 = [_]u8{0} ** 12;
-        return std.meta.stringToEnum(GgmlType, std.ascii.lowerString(&lower, value)) orelse error.InvalidGgmlType;
+        if (value.len > lower.len) return error.InvalidGgmlType;
+        return std.meta.stringToEnum(GgmlType, std.ascii.lowerString(lower[0..value.len], value)) orelse error.InvalidGgmlType;
     }
 
     pub fn isUnsupported(self: GgmlType) bool {
@@ -294,7 +349,9 @@ pub const GgmlType = enum(u32) {
         return switch (self) {
             .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q8_1 => 32,
             .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k => 256,
-            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => 256,
+            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => 256,
+            // QK4_NL, not QK_K: iq4_nl is the only IQ type blocked over 32.
+            .iq4_nl => 32,
             .mxfp4 => 32,
             else => 1,
         };
@@ -325,6 +382,18 @@ pub const GgmlType = enum(u32) {
 
             // MX FP4: 1 byte E8M0 scale + 16 bytes of packed E2M1 nibbles (32 elements)
             .mxfp4 => 17,
+
+            // The IQ block structs, sized off ggml-common.h's own static asserts
+            // with QK_K=256, ggml_half=2, IQ3S_N_SCALE=4, QK4_NL=32.
+            .iq2_xxs => 66, // half + QK_K/8 u16
+            .iq2_xs => 74, // half + QK_K/8 u16 + QK_K/32
+            .iq2_s => 82, // half + QK_K/4 + QK_K/16
+            .iq3_xxs => 98, // half + 3*(QK_K/8)
+            .iq3_s => 110, // half + 13*(QK_K/32) + IQ3S_N_SCALE
+            .iq1_s => 50, // half + QK_K/8 + QK_K/16
+            .iq1_m => 56, // QK_K/8 + QK_K/16 + QK_K/32, no scale field
+            .iq4_nl => 18, // half + QK4_NL/2
+            .iq4_xs => 136, // half + u16 + QK_K/64 + QK_K/2
 
             else => 0,
         };
@@ -375,7 +444,9 @@ const GgufMetadata = struct {
     }
 };
 
-pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const TensorClusters.GroupResult) !void {
+pub const SourcePatch = types.SourcePatch;
+
+pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const TensorClusters.GroupResult, source_patch: ?SourcePatch) !void {
     // we need to track bytes written for calculating alignment for the starting tensor
     var bytes_written: u64 = 0;
 
@@ -429,23 +500,20 @@ pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb
         var matched = false;
         if (try TensorClusters.tryDequantCluster(t, source, groups, self.allocator, &pool)) |f32_buf| {
             defer self.allocator.free(f32_buf);
-            const target_dtype = try types.DataType.fromString(t.type);
-            std.log.info("Writing tensor data for tensor {}/{} {s} - nvfp4/fp8 to {s}, {} elements", .{
+            if (source_patch) |patch| {
+                if (patch.matches == null or patch.matches.?(patch.ctx, t.name)) {
+                    try patch.apply(patch.ctx, self.allocator, t.name, t.dims, "F32", std.mem.sliceAsBytes(f32_buf));
+                }
+            }
+            std.log.info("Writing tensor data for tensor {}/{} {s} - cluster to {s}, {} elements", .{
                 count, total_tensors, t.name, t.type, elements,
             });
-            const out = try DataTransform.Quantizer.convertTensorData(
-                self.allocator,
-                std.mem.sliceAsBytes(f32_buf),
-                .F32,
-                target_dtype,
-                f32_buf.len,
-                &pool,
-            );
-            defer self.allocator.free(out);
-            try (&writer.interface).writeAll(out);
+            // Through writeTensorData, not a bare convert, so an imatrix reaches
+            // these tensors too.
+            try self.writeTensorData(t, .F32, std.mem.sliceAsBytes(f32_buf), &writer.interface, &pool);
             const size = try Gguf.calculateTensorSize(t);
             try self.maybeWritePadding(size, &writer.interface);
-            callbacks.reportProgress(count, total_tensors, t.name, "nvfp4", t.type, @intCast(elements));
+            callbacks.reportProgress(count, total_tensors, t.name, "cluster", t.type, @intCast(elements));
             count += 1;
             matched = true;
         }
@@ -457,40 +525,65 @@ pub fn saveWithSTData(self: Gguf, source: anytype, threads: usize, callbacks: cb
                     (source_tensor.name.len > t.name.len and
                         source_tensor.name[source_tensor.name.len - t.name.len - 1] == '.' and
                         std.mem.endsWith(u8, source_tensor.name, t.name)))
-                    {
-                        matched = true;
-                        std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
-                            count,
-                            total_tensors,
-                            t.name,
-                            source_tensor.type,
-                            t.type,
-                            elements,
-                        });
-                        const source_dtype = try types.DataType.fromString(source_tensor.type);
-                        var n_elements_gg: u64 = 1;
-                        for (t.dims) |d| n_elements_gg *= d;
-                        const source_size_gg: usize = switch (source_dtype.formatType()) {
-                            .safetensors => blk: {
-                                const stype = try st.DType.fromString(@tagName(source_dtype));
-                                break :blk stype.calcSizeInBytes(n_elements_gg);
-                            },
-                            .gguf => blk: {
-                                const stype = try GgmlType.fromString(@tagName(source_dtype));
-                                break :blk stype.calcSizeInBytes(n_elements_gg);
-                            },
-                        };
-                        const source_file_gg = try source.openFileForTensor(source_tensor.name);
-                        const src_bytes_gg = try self.allocator.alloc(u8, source_size_gg);
-                        defer self.allocator.free(src_bytes_gg);
-                        _ = try source_file_gg.readPositionalAll(source.io, src_bytes_gg, source_tensor.offset + source.current_data_begin);
-                        try self.writeTensorData(t, source_dtype, src_bytes_gg, &writer.interface, &pool);
-                        const size = try Gguf.calculateTensorSize(t);
-                        try self.maybeWritePadding(size, &writer.interface);
-                        callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
-                        count += 1;
-                        break;
+                {
+                    matched = true;
+                    std.log.info("Writing tensor data for tensor {}/{} {s} - {s} to {s}, {} elements", .{
+                        count,
+                        total_tensors,
+                        t.name,
+                        source_tensor.type,
+                        t.type,
+                        elements,
+                    });
+                    const source_dtype = try types.DataType.fromString(source_tensor.type);
+                    var n_elements_gg: u64 = 1;
+                    for (t.dims) |d| n_elements_gg *= d;
+                    const source_size_gg: usize = switch (source_dtype.formatType()) {
+                        .safetensors => blk: {
+                            const stype = try st.DType.fromString(@tagName(source_dtype));
+                            break :blk stype.calcSizeInBytes(n_elements_gg);
+                        },
+                        .gguf => blk: {
+                            const stype = try GgmlType.fromString(@tagName(source_dtype));
+                            break :blk stype.calcSizeInBytes(n_elements_gg);
+                        },
+                    };
+                    const source_file_gg = try source.openFileForTensor(source_tensor.name);
+                    const src_bytes_gg = try self.allocator.alloc(u8, source_size_gg);
+                    defer self.allocator.free(src_bytes_gg);
+                    _ = try source_file_gg.readPositionalAll(source.io, src_bytes_gg, source_tensor.offset + source.current_data_begin);
+                    // Block-quantized payloads have no addressable rows to swap, so
+                    // matched tensors dequantize to F32 first and writeTensorData
+                    // requantizes from there (same F32 hop it used internally).
+                    var patch_bytes: []u8 = src_bytes_gg;
+                    var patch_type = source_dtype;
+                    var patch_f32: ?[]u8 = null;
+                    defer if (patch_f32) |b| self.allocator.free(b);
+                    if (source_patch) |patch| {
+                        if (patch.matches == null or patch.matches.?(patch.ctx, source_tensor.name)) {
+                            const already_f32 = source_dtype == .F32 or source_dtype == .f32;
+                            if (!source_dtype.isFloatType() or (patch.force_f32 and !already_f32)) {
+                                patch_f32 = try DataTransform.Quantizer.convertTensorData(
+                                    self.allocator,
+                                    src_bytes_gg,
+                                    source_dtype,
+                                    .F32,
+                                    n_elements_gg,
+                                    &pool,
+                                );
+                                patch_bytes = patch_f32.?;
+                                patch_type = .F32;
+                            }
+                            try patch.apply(patch.ctx, self.allocator, source_tensor.name, source_tensor.dims, @tagName(patch_type), patch_bytes);
+                        }
                     }
+                    try self.writeTensorData(t, patch_type, patch_bytes, &writer.interface, &pool);
+                    const size = try Gguf.calculateTensorSize(t);
+                    try self.maybeWritePadding(size, &writer.interface);
+                    callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
+                    count += 1;
+                    break;
+                }
             }
         }
 
@@ -520,14 +613,7 @@ fn maybeWritePadding(self: Gguf, size: u64, writer: *std.Io.Writer) !void {
     }
 }
 
-pub fn writeTensorData(
-    self: Gguf,
-    t: types.Tensor,
-    source_dtype: types.DataType,
-    source_data: []const u8,
-    writer: *std.Io.Writer,
-    pool: *thread_pool_mod.ThreadPool
-) !void {
+pub fn writeTensorData(self: Gguf, t: types.Tensor, source_dtype: types.DataType, source_data: []const u8, writer: *std.Io.Writer, pool: *thread_pool_mod.ThreadPool) !void {
     const target_dtype = try types.DataType.fromString(t.type);
 
     // Calculate the source tensor size based on source type
@@ -536,18 +622,23 @@ pub fn writeTensorData(
 
     // Convert if types differ, otherwise write directly
     if (source_dtype.equivalentType(@tagName(target_dtype))) {
-        std.log.debug("Using direct data copy for {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
+        std.log.debug("Using direct data copy for {s} to {s}.", .{ @tagName(source_dtype), @tagName(target_dtype) });
         try writer.writeAll(source_data);
     } else {
         // Use DataTransform to convert the data
-        std.log.debug("Converting data from {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
-        const converted_data = try DataTransform.Quantizer.convertTensorData(
+        std.log.debug("Converting data from {s} to {s}.", .{ @tagName(source_dtype), @tagName(target_dtype) });
+        // A tensor the collector never saw has no entry and quantizes exactly
+        // as it would have without the file - absent is unmeasured, not
+        // unimportant, so it must not become a vector of zeros.
+        const weights = if (self.imatrix) |im| im.forTensor(t) else null;
+        const converted_data = try DataTransform.Quantizer.convertTensorDataWeighted(
             self.allocator,
             source_data,
             source_dtype,
             target_dtype,
             n_elements,
             pool,
+            weights,
         );
         defer self.allocator.free(converted_data);
 
@@ -832,7 +923,7 @@ pub fn readGgufTensorHeader(self: Gguf) !void {
                 }
             } else if (self.file_size > 0 and self.data_offset > 0) {
                 // Total data section size available on disk from this tensor's start
-                    const start_pos = std.math.add(u64, self.data_offset, tensor.offset) catch |err| {
+                const start_pos = std.math.add(u64, self.data_offset, tensor.offset) catch |err| {
                     std.log.warn("Warning: Overflow calculating tensor start position for {s}: {}", .{ tensor.name, err });
                     bad_size = true;
                     bad_size_count += 1;
@@ -860,26 +951,14 @@ pub fn readGgufTensorHeader(self: Gguf) !void {
             }
 
             if (tt.isUnsupported()) {
-                std.log.warn(
-                    "{s}: {} (Unsupported type!!!) [{s}] offset from tensor data start {}, offset from file start {}",
-                    .{ tensor.name, tt, dims_buf.items, tensor.offset, tensor.offset + self.data_offset }
-                );
+                std.log.warn("{s}: {} (Unsupported type!!!) [{s}] offset from tensor data start {}, offset from file start {}", .{ tensor.name, tt, dims_buf.items, tensor.offset, tensor.offset + self.data_offset });
             } else if (bad_size) {
-                std.log.warn(
-                    "{s}: {} (BAD SIZE: actual: {}, expected raw: {} expected with padding: {}) [{s}] offset from tensor data start {}, offset from file start {}",
-                    .{ tensor.name, tt, actual_size, total_bytes, expected_padded_size, dims_buf.items, tensor.offset, tensor.offset + self.data_offset }
-                );
+                std.log.warn("{s}: {} (BAD SIZE: actual: {}, expected raw: {} expected with padding: {}) [{s}] offset from tensor data start {}, offset from file start {}", .{ tensor.name, tt, actual_size, total_bytes, expected_padded_size, dims_buf.items, tensor.offset, tensor.offset + self.data_offset });
             } else {
-                std.log.info(
-                    "{s}: {} [{s}] offset from tensor data start {}, offset from file start {}",
-                    .{ tensor.name, tt, dims_buf.items, tensor.offset, tensor.offset + self.data_offset }
-                );
+                std.log.info("{s}: {} [{s}] offset from tensor data start {}, offset from file start {}", .{ tensor.name, tt, dims_buf.items, tensor.offset, tensor.offset + self.data_offset });
             }
         } else {
-            std.log.warn(
-                "{s}: Unknown Type [{s}] offset from tensor data start {}, offset from file start {}",
-                .{tensor.name, dims_buf.items, tensor.offset, tensor.offset + self.data_offset }
-            );
+            std.log.warn("{s}: Unknown Type [{s}] offset from tensor data start {}, offset from file start {}", .{ tensor.name, dims_buf.items, tensor.offset, tensor.offset + self.data_offset });
         }
     }
 
@@ -1117,9 +1196,9 @@ fn writeIndent(writer: *std.Io.Writer, depth: usize) !void {
 
 test "calculates f64 size in bytes correctly" {
     var t = try GgmlType.fromSafetensorsType("f64");
-    
+
     const calculatedSize = t.calcSizeInBytes(12);
-    
+
     try std.testing.expectEqual(96, calculatedSize);
 }
 
@@ -1129,4 +1208,18 @@ test "calculates f16 size in bytes correctly" {
     const calculatedSize = t.calcSizeInBytes(12);
 
     try std.testing.expectEqual(24, calculatedSize);
+}
+
+test "GgmlType.fromString rejects over-long input instead of asserting" {
+    const testing = std.testing;
+    try std.testing.expectEqual(GgmlType.q4_k, try GgmlType.fromString("q4_k"));
+    try testing.expectEqual(GgmlType.q4_k, try GgmlType.fromString("Q4_K"));
+    try testing.expectEqual(GgmlType.iq4_nl_8_8, try GgmlType.fromString("iq4_nl_8_8"));
+    // Safetensors type names reach this from the shared DataType namespace and
+    // are longer than anything here.
+    try testing.expectError(error.InvalidGgmlType, GgmlType.fromString("INT4_CONVROT_SR"));
+    try testing.expectError(error.InvalidGgmlType, GgmlType.fromString("SCALED_F8_E4M3"));
+    try testing.expectError(error.InvalidGgmlType, GgmlType.fromString("ASYM_W4A8_INT8"));
+    try testing.expectError(error.InvalidGgmlType, GgmlType.fromString("nonsense"));
+    try testing.expectError(error.InvalidGgmlType, GgmlType.fromString(""));
 }
