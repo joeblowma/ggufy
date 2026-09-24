@@ -29,6 +29,38 @@ fn formatBytes(bytes: u64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.2} {s}", .{ value, units[unit] }) catch buf[0..0];
 }
 
+/// Refusals convert() and predictOutputSize() have already explained on their
+/// way out, naming what is wrong and which flag gets past it. Leave here rather
+/// than returning: a returned error prints a second, rawer copy of the message
+/// plus a return trace, and a swallowed one tells a calling script the
+/// conversion it did not do succeeded. Nothing has reached the stdout buffer on
+/// these paths, so there is nothing to flush on the way out.
+fn exitIfExplained(err: anyerror) void {
+    switch (err) {
+        error.UnknownArchitecture,
+        error.UpscalingNotAllowed,
+        error.UnknownPretokenizer,
+        error.UnmappedTensors,
+        error.HfNamesUnsupported,
+        error.HfTokenizerUnreadable,
+        error.SidecarExists,
+        error.OutputWouldOverwriteSource,
+        error.MissingArchitecture,
+        error.MissingVocabulary,
+        error.MissingDimensions,
+        error.MissingMerges,
+        error.InvalidArchOverride,
+        error.IncompleteExperts,
+        error.HfConfigUnsupported,
+        error.HfConfigUnusable,
+        error.MmprojMissing,
+        error.MmprojUnusable,
+        error.UnexpectedVisionShape,
+        => std.process.exit(1),
+        else => {},
+    }
+}
+
 /// Predict and print the final output size for a convert, without writing anything.
 fn reportPredictedSize(
     f: anytype,
@@ -40,8 +72,9 @@ fn reportPredictedSize(
     const size = conv.predictOutputSize(f, opts, allocator, arena_alloc) catch |err| {
         if (err == error.UnknownArchitecture) {
             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to calculate size anyway. Results may be suboptimal.", .{});
-            return;
         }
+        // A refused convert predicts the size of a file it will not write.
+        exitIfExplained(err);
         return err;
     };
     var buf: [32]u8 = undefined;
@@ -83,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help                     Display this help and exit.
         \\-d, --datatype <DATATYPE>      When converting, the target datatype (default fp16).
-        \\-f, --filetype <FILETYPE>      When converting, the target filetype: gguf (default), safetensors.
+        \\-f, --filetype <FILETYPE>      When converting, the target filetype: gguf (default), safetensors. GGUF from an HF checkpoint with a vision tower also writes the tower as mmproj-<output name>.gguf, as llama.cpp's converter would.
         \\-t, --template <FILENAME>      When converting, specify a template to use.
         \\-o, --output-dir <DIR>         Output directory (default: same as source file).
         \\-n, --output-name <FILENAME>   Output filename without extension (default: source name + datatype).
@@ -93,9 +126,12 @@ pub fn main(init: std.process.Init) !void {
         \\-s, --sensitivities <FILENAME> Path to a sensitivities JSON file to use (overrides built-in sensitivities) Sensitivities are only used for GGUF model output.
         \\-q, --use-quant-types <QTYPES> Quantization families to use with sensitivity (e.g. "k", "0,k", "0,1,k"). Default: match datatype.
         \\-m, --model-only               When output is safetensors, convert only the main model (UNet/transformer). Ignored for GGUF output.
-        \\-u, --allow-unknown-arch       Allow converting files with unrecognized architectures. Results may be suboptimal.
+        \\-H, --hf-names                 Keep HF state-dict names in the output. Safetensors output: write the HF LLM layout, HF names/shapes and RoPE-unpermuted Q/K from a llama-family GGUF, as model.safetensors unless -n says otherwise; a vision-language GGUF (qwen3vl, qwen2vl, qwen35) takes its vision tower from mmproj-<file name> beside it, or the one .gguf there whose name holds "mmproj" and the file's name. GGUF output: leave an LLM's HF names alone instead of renaming to llama.cpp's blk.*; the architecture is still written where ComfyUI-GGUF's text-encoder loader takes HF names under it (qwen3, qwen3vl, qwen2vl), so a single-file Qwen3-VL loads there with its vision tower.
+        \\-I, --imatrix <FILENAME>       Importance matrix (llama.cpp imatrix GGUF) to steer the quantizer's scale search.
+        \\-F, --force                    With --hf-names, overwrite existing HF sidecars (config.json, tokenizer.json, ...) instead of refusing.
+        \\-u, --allow-unknown-arch       Allow converting files with unrecognized architectures, drop HF LLM tensors that have no llama.cpp name, and convert an LLM whose pre-tokenizer matches no llama.cpp tag (to GGUF: tagged "default", which llama.cpp tokenizes as gpt2; to an HF layout: without a tokenizer.json). Results may be suboptimal.
         \\-U, --allow-upscale            Allow converting from a lower-precision (quantized/FP8) source to a higher-precision target. The extra bits are fill-in; no quality is recovered.
-        \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form; does not affect conversion behaviour.
+        \\-A, --arch <NAME>              Set the architecture name written to the GGUF metadata (GGUF output only). Free-form, but not empty: for an LLM it also prefixes the <arch>.block_count/embedding_length/... keys llama.cpp looks up.
         \\-R, --stochastic-rounding <SEED> Seed for INT4_CONVROT_SR stochastic rounding. Omit for the built-in default seed; pass 0 to disable (deterministic, for comparison). Ignored by other types.
         \\-c, --calculate-size           With convert: compute and print the exact final output size without writing any file.
         \\-S, --shapes                   With names: emit {"name":…,"shape":[…]} objects instead of bare names, for architectures detected by shape.
@@ -157,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
 
     const command = res.positionals[0] orelse {
         std.log.err("No command given. Use --help to get more information.", .{});
-        return;
+        std.process.exit(1);
     };
 
     if (command == .version) {
@@ -168,13 +204,13 @@ pub fn main(init: std.process.Init) !void {
 
     const path = res.positionals[1] orelse {
         std.log.err("No model file specified.", .{});
-        return;
+        std.process.exit(1);
     };
     const filetype = res.args.filetype orelse types.FileType.gguf;
     const datatype: ?types.DataType = res.args.datatype;
     // Refuse a target type the output container cannot hold before opening anything —
     // it used to be accepted and produce a file no reader could load.
-    conv.validateDatatypeForFiletype(datatype, filetype) catch return;
+    conv.validateDatatypeForFiletype(datatype, filetype) catch std.process.exit(1);
     const template_path = res.args.template;
     const output_dir = res.args.@"output-dir";
     const output_name = res.args.@"output-name";
@@ -184,6 +220,8 @@ pub fn main(init: std.process.Init) !void {
     const sensitivities_path = res.args.sensitivities;
 
     const model_only = res.args.@"model-only" != 0;
+    const hf_names = res.args.@"hf-names" != 0;
+    const force = res.args.force != 0;
     const allow_unknown_arch = res.args.@"allow-unknown-arch" != 0;
     const allow_upscale = res.args.@"allow-upscale" != 0;
     const arch_override = res.args.arch;
@@ -192,7 +230,7 @@ pub fn main(init: std.process.Init) !void {
     const allowed_quant_families: ?conv.QuantizationFamilies = if (res.args.@"use-quant-types") |s|
         conv.QuantizationFamilies.parse(s) catch {
             std.log.err("Invalid --use-quant-types value '{s}'. Use a comma-separated list of: 0, 1, k", .{s});
-            return;
+            std.process.exit(1);
         }
     else
         null;
@@ -213,9 +251,12 @@ pub fn main(init: std.process.Init) !void {
         .sensitivities_path = sensitivities_path,
         .allowed_quant_families = allowed_quant_families,
         .model_only = model_only,
+        .hf_names = hf_names,
+        .force = force,
         .allow_unknown_arch = allow_unknown_arch,
         .allow_upscale = allow_upscale,
         .arch_override = arch_override,
+        .imatrix_path = res.args.imatrix,
         .stochastic_rounding = res.args.@"stochastic-rounding",
     };
 
@@ -251,9 +292,8 @@ pub fn main(init: std.process.Init) !void {
                     } else conv.convert(&f, convert_opts, allocator, arena_alloc) catch |err| {
                         if (err == error.UnknownArchitecture) {
                             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
-                            return;
                         }
-                        if (err == error.UpscalingNotAllowed) return;
+                        exitIfExplained(err);
                         return err;
                     };
                 },
@@ -326,9 +366,8 @@ pub fn main(init: std.process.Init) !void {
                     } else conv.convert(&f, convert_opts, allocator, arena_alloc) catch |err| {
                         if (err == error.UnknownArchitecture) {
                             std.log.err("Architecture not recognized. Pass --allow-unknown-arch (-u) to convert anyway. Results may be suboptimal.", .{});
-                            return;
                         }
-                        if (err == error.UpscalingNotAllowed) return;
+                        exitIfExplained(err);
                         return err;
                     };
                 },

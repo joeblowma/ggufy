@@ -7,6 +7,14 @@ const c = @cImport({
 // Re-export only what we need
 pub const ggml_quantize_chunk = c.ggml_quantize_chunk;
 
+// Block geometry, so the hand-written tables can be pinned against ggml's own.
+pub const ggml_blck_size = c.ggml_blck_size;
+pub const ggml_type_size = c.ggml_type_size;
+
+// Which encoders abort without importance weights, asked of ggml rather than
+// hardcoded: the list has changed before (iq1_m is commented out upstream).
+pub const ggml_quantize_requires_imatrix = c.ggml_quantize_requires_imatrix;
+
 pub const ggml_type         = c.ggml_type;
 pub const enum_ggml_type    = c.enum_ggml_type;
 

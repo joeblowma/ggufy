@@ -128,9 +128,13 @@ pub fn main(init: std.process.Init) !void {
             state.template_path = null;
             state.skip_sensitivity = false;
             state.allow_unknown_arch = false;
+            state.pretok_unknown = false;
             state.allow_upscale = false;
             state.upscale_pending = false;
             state.arch_override_buf = std.mem.zeroes([64]u8);
+            state.hf_names = false;
+            state.force = false;
+            state.imatrix_path = null;
             state.tool_status_len = 0;
             state.same_file_error = false;
             const thread = std.Thread.spawn(.{ .allocator = gpa }, fileHandling.loadFile, .{ gpa, arena_alloc, &state }) catch |err| {
@@ -385,8 +389,10 @@ fn showInputFile() void {
         const dir_len = @min(dir.len, state.target_folder_buf.len - 1);
         @memcpy(state.target_folder_buf[0..dir_len], dir[0..dir_len]);
         state.target_folder_buf[dir_len] = 0;
-        // Store base stem for later auto-regeneration
-        const stem = std.fs.path.stem(state.file_selected.?);
+        // Store base stem for later auto-regeneration. Stripped of any dtype the
+        // source name already carries, so re-converting ggufy's own output does
+        // not stack them - same rule the CLI path uses.
+        const stem = conv.stripDtypeSuffix(std.fs.path.stem(state.file_selected.?));
         const stem_len = @min(stem.len, state.filename_base_stem_buf.len - 1);
         @memcpy(state.filename_base_stem_buf[0..stem_len], stem[0..stem_len]);
         state.filename_base_stem_len = stem_len;
@@ -589,6 +595,78 @@ fn showInputFile() void {
                     }
                 }
 
+                // HF names: meaningful for both outputs, with a different effect each
+                {
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    var cwd: dvui.WidgetData = undefined;
+                    _ = dvui.checkbox(@src(), &state.hf_names, "HF names", .{ .gravity_y = 0.5, .data_out = &cwd });
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Write a transformers-loadable directory from a llama-family GGUF: HF tensor names, un-permuted Q/K, and config.json / tokenizer.json / tokenizer_config.json beside the weights.", .{}, .{});
+                    } else {
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Keep an LLM's HF tensor names instead of renaming to llama.cpp's blk.* names. The file then claims no architecture and llama.cpp will not load it.", .{}, .{});
+                    }
+                }
+
+                // Overwrite sidecars, only with HF names on safetensors output
+                {
+                    const active = is_safetensors_out and state.hf_names;
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    var cwd: dvui.WidgetData = undefined;
+                    if (active) {
+                        _ = dvui.checkbox(@src(), &state.force, "Overwrite existing sidecars", .{ .gravity_y = 0.5, .data_out = &cwd });
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Replace config.json, tokenizer.json and the other HF files already in the output folder instead of refusing.", .{}, .{});
+                    } else {
+                        var dummy_force = state.force;
+                        _ = dvui.checkbox(@src(), &dummy_force, "Overwrite existing sidecars", .{ .gravity_y = 0.5, .color_text = dim_color, .data_out = &cwd });
+                        dvui.tooltip(@src(), .{ .active_rect = cwd.borderRectScale().r },
+                            "Only applies with HF names on safetensors output.", .{}, .{});
+                    }
+                }
+
+                // Imatrix file row, dimmed for safetensors output
+                {
+                    const row_color: ?dvui.Color = if (is_safetensors_out) dim_color else null;
+                    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
+                    defer row.deinit();
+                    var lwd: dvui.WidgetData = undefined;
+                    dvui.label(@src(), "Imatrix file", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 120 }, .color_text = row_color, .data_out = &lwd });
+                    dvui.tooltip(@src(), .{ .active_rect = lwd.borderRectScale().r },
+                        "A llama.cpp imatrix GGUF. Steers the quantizer's scale search, and is required for iq1_s, iq2_xxs and iq2_xs.", .{}, .{});
+
+                    const im_display = if (state.imatrix_path) |p| p else "none";
+                    dvui.labelNoFmt(@src(), im_display, .{}, .{ .expand = .horizontal, .gravity_y = 0.5, .color_text = row_color });
+
+                    if (state.imatrix_path != null and !is_safetensors_out) {
+                        if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+                            state.imatrix_path = null;
+                        }
+                    }
+                    var bwd: dvui.WidgetData = undefined;
+                    if (dvui.button(@src(), "Browse...", .{}, .{ .gravity_y = 0.5, .color_text = row_color, .data_out = &bwd })) {
+                        if (!is_safetensors_out and !state.imatrix_dialog_open) {
+                            state.imatrix_dialog_open = true;
+                            SDLBackend.c.SDL_ShowOpenFileDialog(
+                                fileHandling.imatrixFileCallback,
+                                &state,
+                                g_backend.?.window,
+                                &gguf_filters,
+                                gguf_filters.len,
+                                null,
+                                false,
+                            );
+                        }
+                    }
+                    if (is_safetensors_out) {
+                        dvui.tooltip(@src(), .{ .active_rect = bwd.borderRectScale().r },
+                            "An imatrix is only used for GGUF output.", .{}, .{});
+                    }
+                }
+
                 // Skip sensitivity — shown when arch has built-in data; dimmed for safetensors output
                 if (has_sensitivities and state.sensitivity_path == null) {
                     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .all(2) });
@@ -750,6 +828,17 @@ fn showInputFile() void {
             }
         }
 
+        // Ahead of the warnings and the Convert button, both of which read what
+        // it sets: predicting a frame late leaves the button greyed out with the
+        // box explaining why not yet drawn.
+        {
+            const sig = state.predictionSignature();
+            if (state.prev_pred_signature == null or state.prev_pred_signature.? != sig) {
+                state.prev_pred_signature = sig;
+                state.predicted_size = fileHandling.predictSize(gpa, &state);
+            }
+        }
+
         // Unknown architecture warning + override checkbox
         const arch_unknown = file.arch == null;
         if (arch_unknown) {
@@ -768,42 +857,52 @@ fn showInputFile() void {
             _ = dvui.checkbox(@src(), &state.allow_unknown_arch, "Convert anyway", .{});
         }
 
-        // Estimated output size — recompute only when a size-affecting option changes.
-        {
-            const sig = state.predictionSignature();
-            if (state.prev_pred_signature == null or state.prev_pred_signature.? != sig) {
-                state.prev_pred_signature = sig;
-                state.predicted_size = fileHandling.predictSize(gpa, &state);
-            }
+        // Same checkbox, other reason: llama.cpp tokenizes by the pre-tokenizer
+        // tag, and this checkpoint's splitting matches none this tool knows.
+        if (state.pretok_unknown and !arch_unknown) {
+            var warn_box = dvui.box(@src(), .{}, .{
+                .expand = .horizontal,
+                .border = dvui.Rect.all(1),
+                .margin = .{ .x = 0, .y = 6, .w = 0, .h = 2 },
+                .padding = .all(6),
+                .color_border = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 },
+            });
+            defer warn_box.deinit();
+            dvui.label(@src(), "Warning: This model's pre-tokenizer matches no llama.cpp tag. Converting anyway tags it \"default\", which llama.cpp tokenizes as gpt2 and warns about.", .{}, .{
+                .color_text = dvui.Color{ .r = 200, .g = 140, .b = 0, .a = 255 },
+                .margin = .{ .x = 0, .y = 0, .w = 0, .h = 4 },
+            });
+            _ = dvui.checkbox(@src(), &state.allow_unknown_arch, "Convert anyway", .{});
+        }
 
-            if (state.target_dtype != null) {
-                if (state.predicted_size) |psz| {
-                    // Show the exact byte count alongside the human-readable size: `formatBytes`
-                    // uses binary units (÷1024) but labels them "GB", whereas most file browsers
-                    // report decimal "GB" (÷1000), so the pretty number alone looks like a
-                    // mismatch (e.g. 7.50 GB here vs 8.1 GB in a decimal file browser).
-                    var out_buf: [16]u8 = undefined;
-                    const out_str = formatBytes(psz, &out_buf);
-                    var out_commas: [32]u8 = undefined;
-                    const out_bytes_str = formatWithCommas(psz, &out_commas);
-                    if (file.sizeInBytes > 0) {
-                        const pct = @as(f64, @floatFromInt(psz)) / @as(f64, @floatFromInt(file.sizeInBytes)) * 100.0;
-                        dvui.label(@src(), "Estimated output: {s} ({s} bytes)  \u{2022}  {d:.0}% of input", .{ out_str, out_bytes_str, pct }, .{
-                            .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 },
-                            .font = .theme(.body),
-                        });
-                    } else {
-                        dvui.label(@src(), "Estimated output: {s} ({s} bytes)", .{ out_str, out_bytes_str }, .{
-                            .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 },
-                            .font = .theme(.body),
-                        });
-                    }
-                } else {
-                    dvui.label(@src(), "Estimated output: unavailable", .{}, .{
+        // Estimated output size, from the prediction run above.
+        if (state.target_dtype != null) {
+            if (state.predicted_size) |psz| {
+                // Show the exact byte count alongside the human-readable size: `formatBytes`
+                // uses binary units (÷1024) but labels them "GB", whereas most file browsers
+                // report decimal "GB" (÷1000), so the pretty number alone looks like a
+                // mismatch (e.g. 7.50 GB here vs 8.1 GB in a decimal file browser).
+                var out_buf: [16]u8 = undefined;
+                const out_str = formatBytes(psz, &out_buf);
+                var out_commas: [32]u8 = undefined;
+                const out_bytes_str = formatWithCommas(psz, &out_commas);
+                if (file.sizeInBytes > 0) {
+                    const pct = @as(f64, @floatFromInt(psz)) / @as(f64, @floatFromInt(file.sizeInBytes)) * 100.0;
+                    dvui.label(@src(), "Estimated output: {s} ({s} bytes)  \u{2022}  {d:.0}% of input", .{ out_str, out_bytes_str, pct }, .{
                         .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 },
-                        .color_text = dim_color,
+                        .font = .theme(.body),
+                    });
+                } else {
+                    dvui.label(@src(), "Estimated output: {s} ({s} bytes)", .{ out_str, out_bytes_str }, .{
+                        .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 },
+                        .font = .theme(.body),
                     });
                 }
+            } else {
+                dvui.label(@src(), "Estimated output: unavailable", .{}, .{
+                    .margin = .{ .x = 0, .y = 8, .w = 0, .h = 2 },
+                    .color_text = dim_color,
+                });
             }
         }
 
@@ -818,7 +917,7 @@ fn showInputFile() void {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .x = 0, .y = 10, .w = 0, .h = 4 } });
             defer row.deinit();
 
-            const convert_blocked = arch_unknown and !state.allow_unknown_arch;
+            const convert_blocked = (arch_unknown or state.pretok_unknown) and !state.allow_unknown_arch;
             if (convert_blocked) {
                 _ = dvui.button(@src(), "Convert", .{}, .{ .gravity_y = 0.5, .color_text = dim_color });
             } else if (dvui.button(@src(), "Convert", .{}, .{ .gravity_y = 0.5 })) {
@@ -906,7 +1005,7 @@ fn showInputFile() void {
 fn launchConversion(fa: std.mem.Allocator) void {
     const opts = fileHandling.buildConvertOptions(&state);
 
-    const out_path = conv.computeOutputPath(opts, fa) catch {
+    const out_path = conv.computeOutputPath(opts, false, fa) catch {
         // Couldn't compute path - just fire and let the thread report the error.
         state.same_file_error = false;
         state.convert_requested = true;
@@ -914,7 +1013,7 @@ fn launchConversion(fa: std.mem.Allocator) void {
     };
 
     // Reject if output would overwrite the source file.
-    if (std.mem.eql(u8, out_path, state.file_selected.?)) {
+    if (conv.pathsCollide(opts.io, out_path, state.file_selected.?)) {
         state.same_file_error = true;
         return;
     }
@@ -1046,11 +1145,29 @@ fn showConvertDone() void {
 
 // Screen: conversion error
 
+/// A sentence the user can act on, for the errors whose name is not enough.
+fn convertErrorHint(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.TypeRequiresImatrix => "Some tensors are assigned iq1_s/iq2_xs/iq2_xxs, which cannot be encoded without an importance matrix. Choose an imatrix file, or pick types that do not need one.",
+        error.NotAnImatrix => "That file is not a llama.cpp imatrix (its general.type is not \"imatrix\").",
+        error.ImatrixEmpty => "The imatrix file holds no usable entries.",
+        error.UnmappedTensors => "Some tensors have no name in the target vocabulary. Enable \"allow unknown arch\" to drop them, or convert this file as its own architecture.",
+        else => null,
+    };
+}
+
 fn showConvertError() void {
     var outer = dvui.box(@src(), .{}, .{ .gravity_x = 0.5, .gravity_y = 0.5 });
     defer outer.deinit();
 
     dvui.label(@src(), "Conversion failed: {}", .{state.convert_error.?}, .{ .gravity_x = 0.5, .font = .theme(.title) });
+
+    // The error name alone does not say what to do next, and this one is
+    // reachable from an ordinary template + no imatrix, which is not obviously
+    // wrong until you know the rule.
+    if (convertErrorHint(state.convert_error.?)) |hint| {
+        dvui.label(@src(), "{s}", .{hint}, .{ .gravity_x = 0.5 });
+    }
 
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 0.5, .margin = .{ .x = 0, .y = 8, .w = 0, .h = 0 } });
@@ -1352,6 +1469,11 @@ const file_filters = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "GGUF files",       .pattern = "gguf" },
     .{ .name = "Safetensors files",.pattern = "safetensors" },
     .{ .name = "All files",        .pattern = "*" },
+};
+
+const gguf_filters = [_]SDLBackend.c.SDL_DialogFileFilter{
+    .{ .name = "GGUF files", .pattern = "gguf" },
+    .{ .name = "All files",  .pattern = "*" },
 };
 
 const json_filters = [_]SDLBackend.c.SDL_DialogFileFilter{
