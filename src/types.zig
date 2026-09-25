@@ -36,6 +36,44 @@ pub const FileType = enum {
     }
 };
 
+/// `runs` spans of `elem_count` elements of `tensor`, the first `elem_offset`
+/// elements in and each `stride` past the last. With `out_offset` null the
+/// spans land back to back after the previous segment's; otherwise span i
+/// lands at out_offset + i * out_stride, which is how two segments interleave.
+pub const StackSegment = struct {
+    tensor: Tensor,
+    elem_offset: usize,
+    elem_count: usize,
+    runs: usize = 1,
+    stride: usize = 0,
+    out_offset: ?usize = null,
+    out_stride: usize = 0,
+};
+
+/// An output tensor no single source tensor holds: HF's per-expert MoE weights
+/// stacked into llama.cpp's one [n_expert, rows, cols] tensor, one half of a
+/// fused gate_up_proj, or a vision tensor split or joined along an axis. The
+/// segments fill `dims` exactly once between them. `dtype` is what the stacked
+/// tensor is typed as before type assignment; each segment is read as its own
+/// tensor's type.
+pub const ExpertStack = struct {
+    name: []const u8,
+    dims: []const usize,
+    dtype: []const u8,
+    segments: []const StackSegment,
+
+    /// First segment's source name: collapseModelTensors puts the stacked
+    /// tensor where this one was.
+    pub fn anchor(self: ExpertStack) []const u8 {
+        return self.segments[0].tensor.name;
+    }
+
+    pub fn uses(self: ExpertStack, source_name: []const u8) bool {
+        for (self.segments) |seg| if (std.mem.eql(u8, seg.tensor.name, source_name)) return true;
+        return false;
+    }
+};
+
 pub const Tensor = struct {
     name: []const u8,
     type: []const u8,
@@ -53,6 +91,36 @@ pub const Tensor = struct {
             .offset = self.offset,
             .source_path = if (self.source_path) |sp| allocator.dupe(u8, sp) catch null else null,
         };
+    }
+};
+
+/// Optional in-place rewrite of freshly-read source bytes, keyed by source
+/// tensor name/dims. Used by the HF llama paths to apply the Q/K RoPE row
+/// permutation (forward and reverse are separate positional inverses) around
+/// (de/re)quantization. Writers hand `apply` plain float values: quantized
+/// sources are dequantized to F32 first, since block-packed bytes have no
+/// addressable rows. `matches`, when set, skips `apply` for tensors the
+/// patch ignores, so writers do not dequantize tensors for nothing.
+pub const SourcePatch = struct {
+    pub const MatchesFn = *const fn (ctx: *anyopaque, name: []const u8) bool;
+    ctx: *anyopaque,
+    apply: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, name: []const u8, dims: []const usize, source_type: []const u8, bytes: []u8) anyerror!void,
+    matches: ?MatchesFn = null,
+    /// Hand `apply` F32 even when the source is already a float. A patch that
+    /// only moves rows around does not care, but one that does arithmetic does:
+    /// adding 1 to a bf16 norm in bf16 rounds to a different number than adding
+    /// it after the widening the output performs anyway.
+    force_f32: bool = false,
+};
+
+/// Per-column importance weights, looked up by output tensor. Type-erased so
+/// the file writers do not depend on where the weights came from.
+pub const ImatrixLookup = struct {
+    ctx: *const anyopaque,
+    get: *const fn (ctx: *const anyopaque, t: Tensor) ?[]const f32,
+
+    pub fn forTensor(self: ImatrixLookup, t: Tensor) ?[]const f32 {
+        return self.get(self.ctx, t);
     }
 };
 
@@ -135,14 +203,14 @@ pub const DataType = enum {
     /// Comptime table of equivalent (safetensors, gguf) type pairs.
     /// Types with no cross-format equivalent (quantized gguf, FP8, unsigned ints) are omitted.
     const equivalence_table = [_][2]DataType{
-        .{ .F16, .f16  },
-        .{ .F32, .f32  },
-        .{ .F64, .f64  },
+        .{ .F16, .f16 },
+        .{ .F32, .f32 },
+        .{ .F64, .f64 },
         .{ .BF16, .bf16 },
-        .{ .I8,   .i8   },
-        .{ .I16,  .i16  },
-        .{ .I32,  .i32  },
-        .{ .I64,  .i64  },
+        .{ .I8, .i8 },
+        .{ .I16, .i16 },
+        .{ .I32, .i32 },
+        .{ .I64, .i64 },
     };
 
     /// Convert this DataType to the equivalent type for the given file format.
@@ -168,12 +236,21 @@ pub const DataType = enum {
 
         // Determine which is the safetensors type and which is the gguf type.
         const st_type = if (self.formatType() == .safetensors) self else t;
-        const gg_type = if (self.formatType() == .gguf)         self else t;
+        const gg_type = if (self.formatType() == .gguf) self else t;
 
         for (equivalence_table) |pair| {
             if (pair[0] == st_type and pair[1] == gg_type) return true;
         }
         return false;
+    }
+
+    /// True for types whose payload is plain float values in either format and
+    /// can be row-permuted directly; quantized and FP8 payloads must go through F32 first.
+    pub fn isFloatType(self: DataType) bool {
+        return switch (self) {
+            .BF16, .F16, .F32, .F64, .bf16, .f16, .f32, .f64 => true,
+            else => false,
+        };
     }
 
     pub fn formatType(self: DataType) FileType {

@@ -14,6 +14,22 @@ pub const Quantizer = struct {
         element_count: u64,
         pool: *thread_pool_mod.ThreadPool,
     ) ![]u8 {
+        return convertTensorDataWeighted(allocator, src_data, src_type, dst_type, element_count, pool, null);
+    }
+
+    /// The same, with per-column importance weights for the destination type's
+    /// scale search. `imatrix` is one weight per column of a row, so its length
+    /// is the row width and the k-quant encoders are handed whole rows.
+    /// Unweighted callers keep the bit-exact path their golden fixtures pin.
+    pub fn convertTensorDataWeighted(
+        allocator: std.mem.Allocator,
+        src_data: []const u8,
+        src_type: types.DataType,
+        dst_type: types.DataType,
+        element_count: u64,
+        pool: *thread_pool_mod.ThreadPool,
+        imatrix: ?[]const f32,
+    ) ![]u8 {
         // Optimization: Direct copy if types match
         if (src_type.equivalentType(@tagName(dst_type))) {
             const out = try allocator.alloc(u8, src_data.len);
@@ -33,7 +49,7 @@ pub const Quantizer = struct {
         const out_buffer = try allocator.alloc(u8, out_size);
         errdefer allocator.free(out_buffer); // Free on error, otherwise return ownership
 
-        try quantizeFromF32(f32_buffer, out_buffer, dst_type, pool);
+        try quantizeFromF32(f32_buffer, out_buffer, dst_type, pool, imatrix);
 
         return out_buffer;
     }
@@ -106,6 +122,7 @@ pub const Quantizer = struct {
         output_bytes: []u8,
         dst_type: types.DataType,
         pool: *thread_pool_mod.ThreadPool,
+        imatrix: ?[]const f32,
     ) !void {
         switch (dst_type) {
             .f32, .F32 => {
@@ -133,6 +150,13 @@ pub const Quantizer = struct {
             .q8_0, .q5_0, .q4_0,
             .q5_1, .q4_1,
             .q6_k, .q5_k, .q4_k, .q3_k, .q2_k,
+            // The IQ family goes through the same ggml entry point. Several of
+            // their encoders assert on a missing imatrix (iq2_xxs, iq2_xs,
+            // iq1_s, and q2_k's weighted impl), so a tensor the collector never
+            // saw cannot be given one of those types - that aborts rather than
+            // degrades.
+            .iq2_xxs, .iq2_xs, .iq2_s, .iq3_xxs, .iq3_s,
+            .iq1_s, .iq1_m, .iq4_nl, .iq4_xs,
             .mxfp4 => {
                 const gguf_type = try gguf.GgmlType.fromString(@tagName(dst_type));
                 const block_elements = gguf_type.getBlockSize();
@@ -145,6 +169,7 @@ pub const Quantizer = struct {
                     gguf_type,
                     block_elements,
                     block_size,
+                    imatrix,
                 );
             },
             else => return error.UnsupportedDestinationType,
@@ -158,6 +183,7 @@ pub const Quantizer = struct {
         q_type: gguf.GgmlType,
         block_elements: u64,
         block_size: u64,
+        imatrix: ?[]const f32,
     ) !void {
         const element_count: u64 = @intCast(input_f32.len);
         const block_count = @divExact(element_count, block_elements);
@@ -166,42 +192,80 @@ pub const Quantizer = struct {
         // Ensure output buffer is large enough
         if (output_bytes.len < block_count * block_size) return error.OutputBufferTooSmall;
 
-        // divide blocks up for threads
-        const blocks_per_thread = @divTrunc(block_count, threads_u64);
-        const leftover = block_count - (blocks_per_thread * threads_u64);
+        // The work splits into equal units, each handed to ggml as one call.
+        //
+        //   - Unweighted: a unit is one block. Blocks quantize independently, so
+        //     this can ignore the tensor's real row structure - which matters,
+        //     because ggufy blocks over the flat element count and some rows are
+        //     not a whole number of blocks.
+        //   - Weighted: a unit is a whole row. ggml indexes quant_weights by
+        //     position within the row it was handed, so the weights only line up
+        //     if it is told the true row width. Getting this wrong does not fail;
+        //     it applies column 0's importance to every 256th weight and quietly
+        //     produces a worse model than no imatrix at all.
+        // A few encoders abort outright without weights rather than falling back,
+        // so refuse here with a name the caller can report. Reaching ggml with
+        // this combination kills the process mid-file.
+        if (imatrix == null and ggml.ggml_quantize_requires_imatrix(@intCast(@intFromEnum(q_type)))) {
+            return error.TypeRequiresImatrix;
+        }
+        const unit_elems: u64 = if (imatrix) |im| @intCast(im.len) else block_elements;
+        if (unit_elems == 0) return error.InvalidImatrix;
+        if (imatrix != null) {
+            if (unit_elems % block_elements != 0) return error.ImatrixNotBlockAligned;
+            if (element_count % unit_elems != 0) return error.ImatrixWidthMismatch;
+        }
+        const unit_bytes: u64 = (unit_elems / block_elements) * block_size;
+        const units = @divExact(element_count, unit_elems);
+
+        const units_per_thread = @divTrunc(units, threads_u64);
+        const leftover = units - (units_per_thread * threads_u64);
 
         var wg: thread_pool_mod.WaitGroup = .{};
 
         var i: u64 = 0;
         while (i < threads_u64) : (i += 1) {
-            const start = i * blocks_per_thread;
-            var end = start + blocks_per_thread;
+            const start = i * units_per_thread;
+            var end = start + units_per_thread;
             if (i == threads_u64 - 1) {
                 end += leftover;
             }
-            //std.log.debug("Spawning a task for blocks {} - {} of {}", .{ start, end, block_count });
-            pool.spawnWg(&wg, processBlocks, .{ input_f32, output_bytes, start, end, block_elements, block_size, q_type });
+            pool.spawnWg(&wg, processBlocks, .{ input_f32, output_bytes, start, end, unit_elems, unit_bytes, q_type, imatrix });
         }
         wg.wait();
     }
 
-    fn processBlocks(input_f32: []const f32, output_bytes: []u8, start: u64, end: u64, block_elements: u64, block_size: u64, q_type: gguf.GgmlType) void {
-        const size = end - start;
-        const src_offset: usize = @intCast(start * block_elements);
-        const dst_offset: usize = @intCast(start * block_size);
-        const block_elements_usize: usize = @intCast(block_elements);
-        const block_size_usize: usize = @intCast(block_size);
-        const src_block = input_f32[src_offset .. src_offset + block_elements_usize];
-        const dst_block = output_bytes[dst_offset .. dst_offset + block_size_usize];
+    fn processBlocks(
+        input_f32: []const f32,
+        output_bytes: []u8,
+        start: u64,
+        end: u64,
+        unit_elems: u64,
+        unit_bytes: u64,
+        q_type: gguf.GgmlType,
+        imatrix: ?[]const f32,
+    ) void {
+        const units = end - start;
+        const unit_elems_usize: usize = @intCast(unit_elems);
+        const unit_bytes_usize: usize = @intCast(unit_bytes);
+        const src_offset: usize = @intCast(start * unit_elems);
+        const dst_offset: usize = @intCast(start * unit_bytes);
+        // The slices must span all `units` this worker owns: ggml writes through
+        // the raw pointer, so bounds cut to one unit are a lie that a
+        // bounds-checked API would reject.
+        const src_block = input_f32[src_offset..][0 .. units * unit_elems_usize];
+        const dst_block = output_bytes[dst_offset..][0 .. units * unit_bytes_usize];
 
+        // Every unit in this call is the same width, so one weight vector serves
+        // all of them - which is ggml's own contract for quant_weights.
         _ = ggml.ggml_quantize_chunk(
             @as(ggml.enum_ggml_type, @intCast(@intFromEnum(q_type))),
             src_block.ptr,
             dst_block.ptr,
             0,
-            @intCast(size),
-            @intCast(block_elements),
-            null,
+            @intCast(units),
+            @intCast(unit_elems),
+            if (imatrix) |im| im.ptr else null,
         );
     }
 
@@ -1496,7 +1560,7 @@ pub const Quantizer = struct {
         // Quantize via GGML to get GGUF mxfp4 blocks: [E8M0 byte][16 × packed nibbles]
         const gguf_buf = try allocator.alloc(u8, n_blocks * 17);
         defer allocator.free(gguf_buf);
-        try convertTypeGguf(input, gguf_buf, pool, .mxfp4, 32, 17);
+        try convertTypeGguf(input, gguf_buf, pool, .mxfp4, 32, 17, null);
 
         const weight = try allocator.alloc(u8, n / 2);
         errdefer allocator.free(weight);
@@ -2208,5 +2272,149 @@ test "MXFP8 toBlockedMxfp8: matches Python to_blocked reference" {
 
         try std.testing.expectEqual(expected_bytes.len, got.len);
         try std.testing.expectEqualSlices(u8, expected_bytes, got);
+    }
+}
+
+// ============================================================================
+// Activation-aware quantization (ggml imatrix)
+// ============================================================================
+
+fn fillDeterministicWeights(dst: []f32) void {
+    var s: u64 = 0x243F6A8885A308D3; // pi digits, as good a seed as any
+    for (dst, 0..) |*v, i| {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        const bits24: f32 = @floatFromInt(s >> 40);
+        const x = bits24 / 8388608.0 - 1.0; // [-1, 1)
+        v.* = x * 0.05 + (if (i % 512 == 0) @as(f32, 1.0) else 0.0);
+    }
+}
+
+/// A plausible importance spread: lognormal with an occasional outlier channel,
+/// rescaled to mean 1. `sigma` widens it.
+fn fillLognormalImportance(dst: []f32, sigma: f32) void {
+    var s: u64 = 0xDEADBEEF12345678;
+    for (dst, 0..) |*v, j| {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        const u: f32 = @as(f32, @floatFromInt(s >> 40)) / 8388608.0 - 1.0; // [-1, 1)
+        v.* = @exp(sigma * u * 2.0) * (if (j % 97 == 0) @as(f32, 30.0) else 1.0);
+    }
+    var mean: f64 = 0;
+    for (dst) |v| mean += v;
+    mean /= @floatFromInt(dst.len);
+    for (dst) |*v| v.* = @floatCast(@as(f64, v.*) / mean);
+}
+
+/// Quantize `w` to `dst_type` and dequantize straight back, so the caller can
+/// measure what the format cost.
+fn roundtripWeighted(
+    allocator: std.mem.Allocator,
+    w: []const f32,
+    dst_type: types.DataType,
+    pool: *thread_pool_mod.ThreadPool,
+    imatrix: ?[]const f32,
+) ![]f32 {
+    const q = try Quantizer.convertTensorDataWeighted(
+        allocator,
+        std.mem.sliceAsBytes(w),
+        .F32,
+        dst_type,
+        w.len,
+        pool,
+        imatrix,
+    );
+    defer allocator.free(q);
+    const back = try Quantizer.convertTensorData(allocator, q, dst_type, .F32, w.len, pool);
+    defer allocator.free(back);
+    const as_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, back));
+    return allocator.dupe(f32, as_f32);
+}
+
+/// Σ_j w_j · (a_j − b_j)² over every row, weights cycling with the row width.
+/// Exactly the objective ggml's weighted scale search minimizes, which is what
+/// makes it the right yardstick.
+fn weightedSqErr(a: []const f32, b: []const f32, weights: []const f32) f64 {
+    var acc: f64 = 0;
+    for (a, b, 0..) |x, y, i| {
+        const d: f64 = @as(f64, x) - @as(f64, y);
+        acc += @as(f64, weights[i % weights.len]) * d * d;
+    }
+    return acc;
+}
+
+test "an imatrix lowers the weighted error it is given to minimize" {
+    // The receipt that the weights actually reach ggml's scale search, measured
+    // on ggml's own objective - Σ w_j (W-Ŵ)² - because that is what an imatrix
+    // promises to improve. It makes the *plain* squared error worse by
+    // construction; that trade is the entire point.
+    //
+    // q2_k is absent: it is the one type that gets worse on this objective, a
+    // real property of ggml's q2_K encoder rather than a reason to withhold the
+    // weights from it.
+    const allocator = std.testing.allocator;
+    const rows = 16;
+    const cols = 512;
+    const n = rows * cols;
+
+    const w = try allocator.alloc(f32, n);
+    defer allocator.free(w);
+    fillDeterministicWeights(w);
+
+    const imat = try allocator.alloc(f32, cols);
+    defer allocator.free(imat);
+
+    var pool: thread_pool_mod.ThreadPool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 1 });
+    defer pool.deinit();
+
+    // Two spreads, because the benefit is spread-dependent.
+    for ([_]f32{ 1.0, 2.0 }) |sigma| {
+        fillLognormalImportance(imat, sigma);
+        for ([_]types.DataType{ .q3_k, .q4_k, .q5_k, .q6_k, .q4_0, .q4_1, .q5_0, .q5_1 }) |dt| {
+            const plain = try roundtripWeighted(allocator, w, dt, &pool, null);
+            defer allocator.free(plain);
+            const weighted = try roundtripWeighted(allocator, w, dt, &pool, imat);
+            defer allocator.free(weighted);
+
+            const e_plain = weightedSqErr(w, plain, imat);
+            const e_weighted = weightedSqErr(w, weighted, imat);
+            if (!(e_weighted < e_plain)) {
+                std.debug.print(
+                    "sigma {d}: {s}: imatrix did not reduce the weighted error: plain {e:.6} weighted {e:.6}\n",
+                    .{ sigma, @tagName(dt), e_plain, e_weighted },
+                );
+                return error.ImatrixNoBenefit;
+            }
+        }
+    }
+}
+
+test "the GGUF block tables agree with ggml's own for every type we emit" {
+    // getBlockSize and getBytesPerBlock are hand-maintained numbers that decide
+    // how large an output buffer is and how many blocks fit in it. Wrong values
+    // do not fail loudly - they write a file whose tensors are the wrong length.
+    // ggml already knows the answers, so ask it rather than trusting the table.
+    const emitted = [_]types.DataType{
+        .q4_0,    .q4_1,   .q5_0,    .q5_1,  .q8_0,
+        .q2_k,    .q3_k,   .q4_k,    .q5_k,  .q6_k,
+        .iq2_xxs, .iq2_xs, .iq2_s,   .iq3_xxs, .iq3_s,
+        .iq1_s,   .iq1_m,  .iq4_nl,  .iq4_xs,
+        .mxfp4,
+    };
+    for (emitted) |dt| {
+        const t = try gguf.GgmlType.fromString(@tagName(dt));
+        const gt: ggml.enum_ggml_type = @intCast(@intFromEnum(t));
+        const want_block: u64 = @intCast(ggml.ggml_blck_size(gt));
+        const want_bytes: u64 = @intCast(ggml.ggml_type_size(gt));
+        if (t.getBlockSize() != want_block or t.getBytesPerBlock() != want_bytes) {
+            std.debug.print(
+                "{s}: block {d} (ggml {d}), bytes/block {d} (ggml {d})\n",
+                .{ @tagName(dt), t.getBlockSize(), want_block, t.getBytesPerBlock(), want_bytes },
+            );
+            return error.BlockTableMismatch;
+        }
     }
 }

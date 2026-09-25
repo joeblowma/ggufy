@@ -21,6 +21,19 @@ current_file_handle: ?std.Io.File = null,
 current_open_path: []const u8 = "",
 current_data_begin: u64 = 0,
 
+/// Set once `prepareConversion` has rewritten this handle's tensors to HF
+/// state-dict names. A later pass over the same handle (size prediction then
+/// the write) sees HF names and needs to know they are its own doing, not the
+/// source's, before it un-permutes any Q/K rows.
+hf_names_applied: bool = false,
+
+/// The mirror of the above: set once `prepareConversion` has rewritten this
+/// handle's tensors from HF state-dict names to llama.cpp's native ones. The
+/// data stays HF-ordered, so this is what tells a later pass that the Q/K rows
+/// behind those blk.* names still need the RoPE permute - a source that carried
+/// native names of its own is already half-split and must not be permuted.
+native_names_applied: bool = false,
+
 const Safetensors = @This();
 
 /// Opens a safetensors file or directory for reading or writing. `target` indicates the file will be opened for read/write.
@@ -67,15 +80,17 @@ pub fn init(path: []const u8, io: std.Io, allocator: std.mem.Allocator, arena_al
     var entry_path = path;
     const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
     if (stat.kind == .directory) {
+        // Joined into the arena, not `allocator`: entry_path outlives the branch
+        // that builds it, and the tensors below keep their own arena copies of it.
         // Look for index.json
         const paths_index = [_][]const u8{ path, "model.safetensors.index.json" };
-        const index_path = try std.fs.path.join(allocator, &paths_index);
+        const index_path = try std.fs.path.join(arena_alloc, &paths_index);
         if (std.Io.Dir.cwd().access(io, index_path, .{})) {
             entry_path = index_path;
         } else |_| {
             // Look for model.safetensors
             const paths_single = [_][]const u8{ path, "model.safetensors" };
-            const single_path = try std.fs.path.join(allocator, &paths_single);
+            const single_path = try std.fs.path.join(arena_alloc, &paths_single);
             if (std.Io.Dir.cwd().access(io, single_path, .{})) {
                 entry_path = single_path;
             } else |_| {
@@ -189,6 +204,17 @@ fn loadSharded(self: *Safetensors, index_path: []const u8) !void {
         const shard_json = try std.json.parseFromSlice(std.json.Value, self.allocator, header_bytes, .{});
         self.allocator.free(header_bytes);
 
+        // Each shard's tensors come from that shard's own header. Reading the
+        // first shard's header for every one of them silently produces a file
+        // holding the first shard's tensor list N times, pointed at offsets in
+        // files that hold something else.
+        //
+        // The first shard's parse is kept for __metadata__; the rest are freed
+        // once their tensors are extracted, which is safe because
+        // extractTensorsFromObject copies every name, dim and path it keeps.
+        var borrowed: ?std.json.Parsed(std.json.Value) = null;
+        defer if (borrowed) |b| b.deinit();
+
         if (first) {
             self.json_data = shard_json; // Keep ownership of the first one for metadata/structure
             if (shard_json.value.object.get("__metadata__")) |m| {
@@ -196,25 +222,10 @@ fn loadSharded(self: *Safetensors, index_path: []const u8) !void {
             }
             first = false;
         } else {
-            // For subsequent shards, we just extract tensors and discard the JSON
-            // Check for metadata if we haven't found it yet
-            if (self.metadata == null) {
-                if (shard_json.value.object.get("__metadata__")) |m| {
-                    // We need to copy this metadata out because we are about to deinit shard_json
-                    // Actually, simpler to just swap ownership of this json_data if we find metadata
-                    // But that gets messy.
-                    // Let's assume metadata is in the first shard or duplicated.
-                    _ = m;
-                }
-            }
-            defer shard_json.deinit();
+            borrowed = shard_json;
         }
 
-        // We use the JSON object to extract tensors
-        // Note: For the 'first' shard, we are using self.json_data which is valid.
-        // For others, we use shard_json.
-        //const root = if (!first and self.json_data.value == shard_json.value) self.json_data.value.object else shard_json.value.object;
-        try self.extractTensorsFromObject(self.json_data.?.value.object, full_path);
+        try self.extractTensorsFromObject(shard_json.value.object, full_path);
     }
 }
 
@@ -732,14 +743,7 @@ pub fn parseHeader(self: Safetensors) !std.json.Parsed(std.json.Value) {
     return std.json.parseFromSlice(std.json.Value, self.arena_alloc, data, .{});
 }
 
-pub fn writeTensorData(
-    self: Safetensors,
-    t: types.Tensor,
-    source_dtype: types.DataType,
-    source_data: []const u8,
-    writer: *std.Io.Writer,
-    pool: *thread_pool_mod.ThreadPool
-) !void {
+pub fn writeTensorData(self: Safetensors, t: types.Tensor, source_dtype: types.DataType, source_data: []const u8, writer: *std.Io.Writer, pool: *thread_pool_mod.ThreadPool) !void {
     const target_dtype = try types.DataType.fromString(t.type);
 
     // Calculate the source tensor size based on source type
@@ -748,11 +752,11 @@ pub fn writeTensorData(
 
     // Convert if types differ, otherwise write directly
     if (source_dtype.equivalentType(@tagName(target_dtype))) {
-        std.log.debug("Using direct data copy for {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
+        std.log.debug("Using direct data copy for {s} to {s}.", .{ @tagName(source_dtype), @tagName(target_dtype) });
         try writer.writeAll(source_data);
     } else {
         // Use DataTransform to convert the data
-        std.log.debug("Converting data from {s} to {s}.", .{@tagName(source_dtype), @tagName(target_dtype)});
+        std.log.debug("Converting data from {s} to {s}.", .{ @tagName(source_dtype), @tagName(target_dtype) });
         const converted_data = try DataTransform.Quantizer.convertTensorData(
             self.allocator,
             source_data,
@@ -938,7 +942,7 @@ pub fn calculateFileSize(
     return 8 + header_size + data_size;
 }
 
-pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const TensorClusters.GroupResult, stochastic_rounding: u64) !void {
+pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callbacks: cb.ConvertCallbacks, groups: *const TensorClusters.GroupResult, stochastic_rounding: u64, source_patch: ?types.SourcePatch) !void {
     // Build the full header JSON object (tensor entries + __metadata__)
     const header_obj = buildHeaderObject(self.arena_alloc, self.metadata, self.tensors.items) catch |err| {
         reportUnwritableDtype(self.tensors.items);
@@ -1000,11 +1004,21 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
 
             if (src_f32) |data| {
                 defer self.allocator.free(data);
+                if (source_patch) |patch| {
+                    if (patch.matches == null or patch.matches.?(patch.ctx, t.name)) {
+                        try patch.apply(patch.ctx, self.allocator, t.name, t.dims, "F32", std.mem.sliceAsBytes(data));
+                    }
+                }
                 if (dest_is_cluster) {
                     try TensorClusters.writeClusterData(&writer.interface, self.allocator, dt, data, t.dims, stochastic_rounding, &pool);
                 } else {
                     const out = try DataTransform.Quantizer.convertTensorData(
-                        self.allocator, std.mem.sliceAsBytes(data), .F32, dt, data.len, &pool,
+                        self.allocator,
+                        std.mem.sliceAsBytes(data),
+                        .F32,
+                        dt,
+                        data.len,
+                        &pool,
                     );
                     defer self.allocator.free(out);
                     try (&writer.interface).writeAll(out);
@@ -1056,7 +1070,32 @@ pub fn saveWithSTData(self: Safetensors, source: anytype, threads: usize, callba
                 const src_bytes_st = try self.allocator.alloc(u8, source_size_st);
                 defer self.allocator.free(src_bytes_st);
                 _ = try source_file_st.readPositionalAll(source.io, src_bytes_st, source_tensor.offset + source.current_data_begin);
-                try self.writeTensorData(t, source_dtype, src_bytes_st, &writer.interface, &pool);
+                // Block-quantized payloads have no addressable rows to swap, so
+                // matched tensors dequantize to F32 first and writeTensorData
+                // requantizes from there (same F32 hop it used internally).
+                var patch_bytes: []u8 = src_bytes_st;
+                var patch_type = source_dtype;
+                var patch_f32: ?[]u8 = null;
+                defer if (patch_f32) |b| self.allocator.free(b);
+                if (source_patch) |patch| {
+                    if (patch.matches == null or patch.matches.?(patch.ctx, source_tensor.name)) {
+                        const already_f32 = source_dtype == .F32 or source_dtype == .f32;
+                        if (!source_dtype.isFloatType() or (patch.force_f32 and !already_f32)) {
+                            patch_f32 = try DataTransform.Quantizer.convertTensorData(
+                                self.allocator,
+                                src_bytes_st,
+                                source_dtype,
+                                .F32,
+                                n_elements_st,
+                                &pool,
+                            );
+                            patch_bytes = patch_f32.?;
+                            patch_type = .F32;
+                        }
+                        try patch.apply(patch.ctx, self.allocator, source_tensor.name, source_tensor.dims, @tagName(patch_type), patch_bytes);
+                    }
+                }
+                try self.writeTensorData(t, patch_type, patch_bytes, &writer.interface, &pool);
                 callbacks.reportProgress(count, total_tensors, t.name, source_tensor.type, t.type, @intCast(elements));
                 count += 1;
             }

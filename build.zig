@@ -258,6 +258,34 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(precision_metrics_test).step);
+
+    const hf_llm_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/HfLlm.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "build_options", .module = options_mod },
+            },
+        }),
+    });
+    ggml.link(b, hf_llm_test, target, optimize);
+    test_step.dependOn(&b.addRunArtifact(hf_llm_test).step);
+
+    const imatrix_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/Imatrix.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ggml.h", .module = ggml_h_module },
+                .{ .name = "build_options", .module = options_mod },
+            },
+        }),
+    });
+    ggml.link(b, imatrix_test, target, optimize);
+    test_step.dependOn(&b.addRunArtifact(imatrix_test).step);
 }
 
 fn get_git_version(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {

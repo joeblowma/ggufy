@@ -99,6 +99,9 @@ pub const AsymW4a8Cluster = struct {
     convrot_group_size: usize, // Hadamard rotation group (256)
 };
 
+pub const StackSegment = types.StackSegment;
+pub const ExpertStack = types.ExpertStack;
+
 pub const GroupResult = struct {
     fp4_clusters: []Fp4Cluster,
     float8_clusters: []Float8Cluster,
@@ -107,6 +110,9 @@ pub const GroupResult = struct {
     int8_convrot_clusters: []Int8ConvrotCluster,
     int4_clusters: []Int4Cluster,
     asym_w4a8_clusters: []AsymW4a8Cluster,
+    /// Filled by the caller, not groupClusters: which tensors stack is a question
+    /// about names, and only the HF rename knows them.
+    expert_stacks: []const ExpertStack = &.{},
 };
 
 /// Parse the JSON payload of a comfy_quant blob to identify the quantization scheme.
@@ -1337,6 +1343,24 @@ pub fn tryDequantCluster(
     allocator: std.mem.Allocator,
     pool: *thread_pool_mod.ThreadPool,
 ) !?[]f32 {
+    if (try dequantClusterWeight(dest_tensor, source, groups, allocator, pool)) |w| return w;
+    for (groups.expert_stacks) |stack| {
+        if (std.mem.eql(u8, stack.name, dest_tensor.name)) {
+            return try gatherExpertStack(stack, source, groups, allocator, pool);
+        }
+    }
+    return null;
+}
+
+/// The cluster half of tryDequantCluster. A stack segment reads through this,
+/// never through a stack.
+fn dequantClusterWeight(
+    dest_tensor: types.Tensor,
+    source: anytype,
+    groups: *const GroupResult,
+    allocator: std.mem.Allocator,
+    pool: *thread_pool_mod.ThreadPool,
+) !?[]f32 {
     for (groups.fp4_clusters) |cluster| {
         if (nameSuffixMatch(cluster.weight.name, dest_tensor.name)) {
             return try dequantizeFp4Cluster(cluster, source, allocator, pool);
@@ -1373,6 +1397,69 @@ pub fn tryDequantCluster(
         }
     }
     return null;
+}
+
+/// Read every segment of `stack` into place as F32. Caller owns the slice.
+/// A segment whose tensor is a quantized cluster weight is dequantized whole
+/// through `groups` first, since its bytes have no addressable elements.
+pub fn gatherExpertStack(
+    stack: ExpertStack,
+    source: anytype,
+    groups: *const GroupResult,
+    allocator: std.mem.Allocator,
+    pool: *thread_pool_mod.ThreadPool,
+) ![]f32 {
+    var total: usize = 1;
+    for (stack.dims) |d| total *= d;
+    const out = try allocator.alloc(f32, total);
+    errdefer allocator.free(out);
+
+    var at: usize = 0;
+    var filled: usize = 0;
+    for (stack.segments) |seg| {
+        const runs = @max(seg.runs, 1);
+        const span = (runs - 1) * seg.stride + seg.elem_count;
+        const dtype = try types.DataType.fromString(seg.tensor.type);
+
+        var whole: ?[]f32 = null;
+        defer if (whole) |w| allocator.free(w);
+        var part: ?[]u8 = null;
+        defer if (part) |b| allocator.free(b);
+        const src: []const f32 = if (!dtype.isFloatType()) blk: {
+            const w = (try dequantClusterWeight(seg.tensor, source, groups, allocator, pool)) orelse w: {
+                // A block-quantized GGUF tensor: its blocks dequantize on their own.
+                var n: usize = 1;
+                for (seg.tensor.dims) |d| n *= d;
+                const raw = try allocator.alloc(u8, @intCast(seg.tensor.size));
+                defer allocator.free(raw);
+                const file = try source.openFileForTensor(seg.tensor.name);
+                _ = try file.readPositionalAll(source.io, raw, seg.tensor.offset + source.current_data_begin);
+                const bytes = try DataTransform.Quantizer.convertTensorData(allocator, raw, dtype, .F32, n, pool);
+                break :w @as([]f32, @alignCast(std.mem.bytesAsSlice(f32, bytes)));
+            };
+            whole = w;
+            if (seg.elem_offset + span > w.len) return error.ExpertStackOverflow;
+            break :blk w[seg.elem_offset..][0..span];
+        } else blk: {
+            const elem_bytes: usize = @intCast(dtype.calcSizeInBytes(1));
+            const buf = try allocator.alloc(u8, span * elem_bytes);
+            defer allocator.free(buf);
+            const file = try source.openFileForTensor(seg.tensor.name);
+            _ = try file.readPositionalAll(source.io, buf, seg.tensor.offset + source.current_data_begin + seg.elem_offset * elem_bytes);
+            part = try DataTransform.Quantizer.convertTensorData(allocator, buf, dtype, .F32, span, pool);
+            break :blk @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, part.?)));
+        };
+
+        for (0..runs) |r| {
+            const dst = if (seg.out_offset) |o| o + r * seg.out_stride else at;
+            if (dst + seg.elem_count > total) return error.ExpertStackOverflow;
+            @memcpy(out[dst..][0..seg.elem_count], src[r * seg.stride ..][0..seg.elem_count]);
+            if (seg.out_offset == null) at += seg.elem_count;
+        }
+        filled += runs * seg.elem_count;
+    }
+    if (filled != total) return error.ExpertStackShort;
+    return out;
 }
 
 /// Single dequant entry point for the safetensors writer: reconstruct output tensor `t`'s source
@@ -1425,12 +1512,28 @@ pub fn collapseModelTensors(
     if (groups.fp4_clusters.len == 0 and groups.float8_clusters.len == 0 and
         groups.mxfp4_clusters.len == 0 and groups.mxfp8_clusters.len == 0 and
         groups.int8_convrot_clusters.len == 0 and groups.int4_clusters.len == 0 and
-        groups.asym_w4a8_clusters.len == 0) return;
+        groups.asym_w4a8_clusters.len == 0 and groups.expert_stacks.len == 0) return;
 
     var new_tensors: std.ArrayList(types.Tensor) = .empty;
 
     for (model_tensors.items) |t| {
         var handled = false;
+
+        // One fused gate_up source anchors two stacks, so every match emits.
+        for (groups.expert_stacks) |stack| {
+            if (std.mem.eql(u8, stack.anchor(), t.name)) {
+                var new_t = t;
+                new_t.name = stack.name;
+                new_t.dims = try arena_alloc.dupe(usize, stack.dims);
+                new_t.type = stack.dtype;
+                var n: usize = 1;
+                for (stack.dims) |d| n *= d;
+                const dtype = try types.DataType.fromString(stack.dtype);
+                new_t.size = @intCast(dtype.calcSizeInBytes(n));
+                try new_tensors.append(arena_alloc, new_t);
+            }
+            if (stack.uses(t.name)) handled = true;
+        }
 
         for (groups.fp4_clusters) |cluster| {
             if (nameSuffixMatch(cluster.weight.name, t.name)) {

@@ -41,10 +41,20 @@ pub const Precision = enum(u8) {
 /// Unlike `keys_hiprec` this does not jump to the source dtype - it lifts to the
 /// cheapest rung of the requested format's own family that clears the floor.
 pub const PrecisionFloor = struct {
-    /// Tensor name substring, matched the same way `keys_hiprec` is.
+    /// Tensor name substring, matched the same way `keys_hiprec` is, or the whole
+    /// name / dot-delimited tail when `named`.
     key: []const u8,
     min: Precision,
+    named: bool = false,
 };
+
+/// Whole name, or the tail after a dot: "output.weight" matches model.output.weight
+/// and not blk.0.attn_output.weight.
+fn namedMatch(key: []const u8, named: []const u8) bool {
+    if (std.mem.eql(u8, key, named)) return true;
+    return key.len > named.len and key[key.len - named.len - 1] == '.' and
+        std.mem.endsWith(u8, key, named);
+}
 
 /// Represents a model architecture with its detection keys and configuration
 pub const Arch = struct {
@@ -52,6 +62,16 @@ pub const Arch = struct {
     name: []const u8,
     /// Whether to reshape tensors for this architecture
     shape_fix: bool = false,
+    /// Whether the "model."-prefix component filter and prefix stripping apply.
+    /// Those are diffusion-bundle conventions; arches whose tensors are already
+    /// the whole model (LLM state dicts) set false so every tensor survives
+    /// under its raw name.
+    component_filter: bool = true,
+    /// Whether block quants must see whole rows. Consumers that index blocks per
+    /// row (llama.cpp) require the on-disk contiguous dim to be a multiple of the
+    /// block size; tensors that cannot align fall back to a compatible float type.
+    /// shape_fix arches self-align via the (n/256, 256) reshape and leave this false.
+    row_aligned_blocks: bool = false,
     /// List of key sets to match in state dict (any set matching = detected)
     /// Each inner slice is a set of keys that must ALL be present
     keys_detect: []const []const []const u8,
@@ -64,6 +84,10 @@ pub const Arch = struct {
     shape_detect: []const ShapeRule = &.{},
     /// Keys that need to be kept in fp32/high precision
     keys_hiprec: []const []const u8 = &.{},
+    /// Keys protected by whole-name match (or after a dot boundary), unlike the
+    /// anywhere-substring match of keys_hiprec: "output.weight" here protects the
+    /// top-level output table but not blk.N.attn_output.weight.
+    keys_hiprec_named: []const []const u8 = &.{},
     /// Keys kept high-precision only in their narrow form (see NarrowRule)
     keys_hiprec_narrow: []const NarrowRule = &.{},
     /// Tensors that must not be stored below a given precision (see PrecisionFloor).
@@ -84,6 +108,22 @@ pub const Arch = struct {
     /// from fine-tuned source files. Top-level keys are merged into the output `config` KV,
     /// with the source file's keys taking priority over these defaults.
     base_config_json: []const u8 = "",
+    /// config.json `model_type` that identifies this architecture in a HuggingFace
+    /// LLM checkpoint (see HfLlm.zig). Empty means unreachable via HF directories.
+    hf_model_type: []const u8 = "",
+    /// Whether `name` is also a GGUF architecture id, i.e. safe to write as
+    /// general.architecture. False for names that only exist to tell two key
+    /// sets apart here: writing one would rename the file's architecture to
+    /// something no consumer knows, while its <arch>.* keys kept the old prefix.
+    /// Such a file keeps whatever architecture its source declared.
+    gguf_arch_id: bool = true,
+    /// Whether `keys_detect` matches a whole family rather than this one model:
+    /// llama's key set is equally Gemma's, Granite's, OLMo's and MiniCPM's. The
+    /// name is then a shape, not an identity, so a source that already names its
+    /// architecture keeps that name instead of being renamed to this one - which
+    /// would leave the file claiming an architecture its <arch>.* keys do not
+    /// use. -A still names it by hand.
+    keys_family_wide: bool = false,
 
     /// Check if this architecture matches the given tensor names
     pub fn matches(self: Arch, tensor_names: []const []const u8) bool {
@@ -126,6 +166,14 @@ pub const Arch = struct {
         return false;
     }
 
+    /// Whole-name or dot-boundary match; see keys_hiprec_named.
+    pub fn isHighPrecisionNamed(self: Arch, key: []const u8) bool {
+        for (self.keys_hiprec_named) |named| {
+            if (namedMatch(key, named)) return true;
+        }
+        return false;
+    }
+
     /// Check if a key should be kept in high precision given the shape it arrived with.
     /// `dims` is outermost-first, so the contiguous extent is the last entry.
     pub fn isNarrowHighPrecision(self: Arch, key: []const u8, dims: []const usize) bool {
@@ -141,7 +189,8 @@ pub const Arch = struct {
     pub fn precisionFloor(self: Arch, key: []const u8) ?Precision {
         var strictest: ?Precision = null;
         for (self.precision_floor) |rule| {
-            if (std.mem.indexOf(u8, key, rule.key) == null) continue;
+            const hit = if (rule.named) namedMatch(key, rule.key) else std.mem.indexOf(u8, key, rule.key) != null;
+            if (!hit) continue;
             if (strictest == null or @intFromEnum(rule.min) > @intFromEnum(strictest.?)) {
                 strictest = rule.min;
             }
@@ -209,10 +258,8 @@ fn allKeysPresent(key_set: []const []const u8, tensor_names: []const []const u8)
 
 fn containsKey(tensor_names: []const []const u8, key: []const u8) bool {
     for (tensor_names) |name| {
-        const stripped = stripPrefix(name);
-        if (std.mem.eql(u8, stripped, key)) {
-            return true;
-        }
+        if (std.mem.eql(u8, name, key)) return true;
+        if (std.mem.eql(u8, stripPrefix(name), key)) return true;
     }
     return false;
 }
@@ -618,6 +665,7 @@ pub const mageflow = Arch{
     //   - img_in / txt_in / proj_out: patch embed/unembed and text input proj.
     //   - norm_out.linear: final AdaLN modulation.
     //   - time_text_embed: timestep embedding MLP.
+    //   - modulation_down: see below.
     .keys_hiprec = &.{
         "txt_norm.weight",
         "img_in.",
@@ -625,6 +673,25 @@ pub const mageflow = Arch{
         "proj_out.",
         "norm_out.linear",
         "time_text_embed",
+        "modulation_down",
+    },
+    // This arch factors modulation as a rank-256 QR: modulation_down holds the
+    // orthonormal basis and each block's img_mod.1/txt_mod.1 the coefficients.
+    // Both halves need care that a full-rank weight does not.
+    //
+    // modulation_down is 0.79M params and every block's modulation reads it, so
+    // its error lands in all 24 up-projections at once with nothing to average
+    // against, and orthonormal rows leave no slack to absorb it. Quantizing it
+    // alone accounts for over half the error energy in the reconstructed
+    // modulation matrix, so it goes in keys_hiprec for ~2 MiB.
+    //
+    // The up-projections are 4% of the weights, too much to force to F32, but
+    // 4-bit takes the reconstruction to ~13% error against ~0.6% at 8-bit. Floor
+    // them at 8 bits: free in a Q8_0 build, and the difference between working
+    // and not in a Q4_K one. Their bias is 1-D and already F32.
+    .precision_floor = &.{
+        .{ .key = ".img_mod.", .min = .bits8 },
+        .{ .key = ".txt_mod.", .min = .bits8 },
     },
     // RMSNorm scales, as for Qwen-Image (shared block implementation).
     .upcast_from_bf16 = &.{
@@ -840,6 +907,192 @@ pub const sensenova_u15 = Arch{
     },
 };
 
+/// LLM families llama.cpp consumes natively. Datasets cover both name spaces:
+/// GGUF-native (blk.N.*, token_embd) for requantizing llama.cpp files, HF
+/// (model.layers.N.*) for checkpoints. They quantize uniformly - the sensitivity
+/// files are per-layer image-damage data and say nothing about LLM layers - keep
+/// every tensor under its raw name, and need row-aligned blocks because
+/// llama.cpp indexes blocks per row.
+///
+/// The LM head and the token table both decide the output token, and a q4_k row
+/// of 128k logits shows - but six bits is enough for either, so they take a
+/// floor rather than the source dtype. llama.cpp's own mixes put them on the
+/// same rung (q6_k under Q4_K_M). Named match: blk.N.attn_output.weight ends in
+/// "output.weight" too and is an ordinary projection.
+const llm_output_floor = [_]PrecisionFloor{
+    .{ .key = "output.weight", .min = .bits6, .named = true },
+    .{ .key = "lm_head.weight", .min = .bits6, .named = true },
+    .{ .key = "token_embd.weight", .min = .bits6, .named = true },
+    .{ .key = "model.embed_tokens.weight", .min = .bits6, .named = true },
+};
+
+/// Substrings shared by the families: the MoE router (native and HF names).
+/// "mlp.gate." needs the trailing dot so mlp.gate_proj stays quantizable.
+const llm_substring_protected = [_][]const u8{
+    "ffn_gate_inp",
+    "mlp.gate.",
+    // The Gated DeltaNet short convolution. llama.cpp keeps it f32 and ggml has
+    // no quantized kernel for it.
+    "ssm_conv1d",
+    // A vision tower's position table, kept under its HF name by -H. llama.cpp
+    // keeps it f32 in an mmproj, and its values run far past one q8_0 step.
+    "visual.pos_embed.",
+};
+
+pub const llama = Arch{
+    .name = "llama",
+    .hf_model_type = "llama",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    .keys_family_wide = true,
+    .threshhold = null,
+    .keys_detect = &.{
+        &.{ "token_embd.weight", "blk.0.attn_q.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "blk.0.ffn_down.weight" },
+        &.{ "model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight", "model.layers.0.self_attn.k_proj.weight", "model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.down_proj.weight" },
+    },
+    .keys_hiprec = &llm_substring_protected,
+    .precision_floor = &llm_output_floor,
+};
+
+pub const qwen3 = Arch{
+    .name = "qwen3",
+    .hf_model_type = "qwen3",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    // Gemma3 carries the same head norms.
+    .keys_family_wide = true,
+    .threshhold = null,
+    .keys_detect = &.{
+        &.{ "token_embd.weight", "blk.0.attn_q.weight", "blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight", "blk.0.ffn_down.weight" },
+        &.{ "model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight", "model.layers.0.self_attn.q_norm.weight", "model.layers.0.self_attn.k_norm.weight", "model.layers.0.mlp.down_proj.weight" },
+    },
+    .keys_hiprec = &llm_substring_protected,
+    .precision_floor = &llm_output_floor,
+};
+
+/// Qwen3-VL's language tower: qwen3 with M-RoPE, beside a vision tower that
+/// goes in an mmproj file. Detected by HF names only; its GGUF names are qwen3's.
+pub const qwen3vl = Arch{
+    .name = "qwen3vl",
+    .hf_model_type = "qwen3_vl",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    .keys_family_wide = true,
+    .threshhold = null,
+    // Qwen3VLModel puts the towers at the top level, the ForConditionalGeneration
+    // wrapper under model.
+    .keys_detect = &.{
+        &.{ "language_model.embed_tokens.weight", "language_model.layers.0.self_attn.q_norm.weight", "visual.patch_embed.proj.weight" },
+        &.{ "model.language_model.embed_tokens.weight", "model.language_model.layers.0.self_attn.q_norm.weight", "model.visual.patch_embed.proj.weight" },
+    },
+    .keys_hiprec = &llm_substring_protected,
+    .precision_floor = &llm_output_floor,
+};
+
+/// Qwen2.5-VL's language tower: qwen2 with M-RoPE, beside a vision tower that
+/// goes in an mmproj file. llama.cpp calls it qwen2vl. The legacy layout puts
+/// the towers at the top level, the newer one under model.
+pub const qwen2vl = Arch{
+    .name = "qwen2vl",
+    .hf_model_type = "qwen2_5_vl",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    .keys_family_wide = true,
+    .threshhold = null,
+    .keys_detect = &.{
+        &.{ "model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.bias", "visual.patch_embed.proj.weight", "visual.merger.ln_q.weight" },
+        &.{ "model.language_model.embed_tokens.weight", "model.language_model.layers.0.self_attn.q_proj.bias", "model.visual.patch_embed.proj.weight", "model.visual.merger.ln_q.weight" },
+    },
+    .keys_hiprec = &llm_substring_protected,
+    .precision_floor = &llm_output_floor,
+};
+
+pub const qwen3moe = Arch{
+    .name = "qwen3moe",
+    .hf_model_type = "qwen3_moe",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    // qwen3vlmoe's text tower ships the same names.
+    .keys_family_wide = true,
+    .threshhold = null,
+    // The HF set names expert 0 only: the fused 3-D layout has no per-expert
+    // names, and detection is for bare files, which this converter only stacks
+    // when a config.json says how many experts there are.
+    .keys_detect = &.{
+        &.{ "token_embd.weight", "blk.0.attn_q_norm.weight", "blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate_exps.weight" },
+        &.{ "model.embed_tokens.weight", "model.layers.0.self_attn.q_norm.weight", "model.layers.0.mlp.gate.weight", "model.layers.0.mlp.experts.0.gate_proj.weight" },
+    },
+    .keys_hiprec = &llm_substring_protected,
+    .precision_floor = &llm_output_floor,
+};
+
+pub const qwen2 = Arch{
+    .name = "qwen2",
+    .hf_model_type = "qwen2",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    // Every pre-qwen3 model that kept its attention biases matches this.
+    .keys_family_wide = true,
+    .threshhold = null,
+    // Native key set carries the attention biases; qwen3 (no bias, with head
+    // norms) must not claim a qwen2 file and vice versa, so each set requires
+    // its own discriminator. Banned HF head-norm keys keep a qwen3 checkpoint
+    // out even if the bias check were somehow inconclusive.
+    .keys_detect = &.{
+        &.{ "token_embd.weight", "blk.0.attn_q.weight", "blk.0.attn_q.bias", "blk.0.ffn_gate.weight", "blk.0.ffn_down.weight" },
+        &.{ "model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight", "model.layers.0.self_attn.q_proj.bias", "model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.down_proj.weight" },
+    },
+    .keys_banned = &.{ "model.layers.0.self_attn.q_norm.weight" },
+    .keys_hiprec = &llm_substring_protected,
+    .precision_floor = &llm_output_floor,
+};
+
+pub const qwen35 = Arch{
+    .name = "qwen35",
+    .hf_model_type = "qwen3_5",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    // qwen3next ships the same tensor names, so detection alone cannot tell the
+    // two apart: write "qwen35" when a config.json says so, and leave a GGUF
+    // that already names itself alone.
+    .keys_family_wide = true,
+    .threshhold = null,
+    // Hybrid linear-attention blocks: blk.0 carries the ssm path, later blocks
+    // the full attention the same files also ship.
+    //
+    // The HF set is under model.language_model.*, not model.*: these ship as
+    // ForConditionalGeneration checkpoints with the text tower nested beside a
+    // vision one.
+    .keys_detect = &.{
+        &.{ "token_embd.weight", "blk.0.attn_qkv.weight", "blk.0.ssm_out.weight", "blk.0.ssm_a" },
+        &.{
+            "model.language_model.embed_tokens.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            "model.language_model.layers.0.linear_attn.A_log",
+        },
+    },
+    .keys_hiprec = &llm_substring_protected,
+    .precision_floor = &llm_output_floor,
+    // ggml has no quantized short-convolution kernel, and llama.cpp's converter
+    // writes this one f32 whatever the rest of the file is.
+    .upcast_from_bf16 = &.{".ssm_conv1d.weight"},
+};
+
+pub const qwen35moe = Arch{
+    .name = "qwen35moe",
+    .hf_model_type = "qwen3_5_moe",
+    .component_filter = false,
+    .row_aligned_blocks = true,
+    .gguf_arch_id = false,
+    .threshhold = null,
+    .keys_detect = &.{
+        &.{ "token_embd.weight", "blk.0.attn_qkv.weight", "blk.0.ssm_out.weight", "blk.0.ffn_up_exps.weight" },
+    },
+    .keys_hiprec = &llm_substring_protected,
+    .precision_floor = &llm_output_floor,
+};
+
 /// List of all known architectures, in detection priority order
 pub const arch_list = [_]*const Arch{
     &flux,
@@ -862,6 +1115,14 @@ pub const arch_list = [_]*const Arch{
     &krea2,
     &minimax_h3,
     &sensenova_u15,
+    &qwen35moe,
+    &qwen35,
+    &qwen3vl,
+    &qwen3moe,
+    &qwen3,
+    &qwen2vl,
+    &qwen2,
+    &llama,
 };
 
 /// Core matcher: names must match, and any `shape_detect` rules must hold.
@@ -1227,6 +1488,8 @@ test "mage_flow keeps the conditioning and IO path high-precision" {
         "norm_out.linear.weight",
         "time_text_embed.timestep_embedder.linear_1.weight",
         "model.diffusion_model.proj_out.bias",
+        "modulation_down.weight",
+        "model.diffusion_model.modulation_down.bias",
     };
     for (protected) |k| try std.testing.expect(mageflow.isHighPrecision(k));
 
@@ -1234,10 +1497,25 @@ test "mage_flow keeps the conditioning and IO path high-precision" {
     const backbone = [_][]const u8{
         "transformer_blocks.0.attn.to_q.weight",
         "transformer_blocks.11.img_mlp.net.0.proj.weight",
-        "transformer_blocks.5.txt_mod.1.weight",
         "transformer_blocks.7.attn.add_v_proj.weight",
     };
     for (backbone) |k| try std.testing.expect(!mageflow.isHighPrecision(k));
+}
+
+test "mage_flow floors the modulation up-projections at 8 bits" {
+    // Full precision would cost 4% of the weights; 4-bit wrecks the rank-256
+    // reconstruction. Everything else in a block stays at the requested type.
+    for ([_][]const u8{
+        "transformer_blocks.0.img_mod.1.weight",
+        "transformer_blocks.11.txt_mod.1.weight",
+        "model.diffusion_model.transformer_blocks.5.img_mod.1.bias",
+    }) |k| try std.testing.expectEqual(Precision.bits8, mageflow.precisionFloor(k).?);
+
+    try std.testing.expect(mageflow.precisionFloor("transformer_blocks.0.attn.to_q.weight") == null);
+    try std.testing.expect(mageflow.precisionFloor("modulation_down.weight") == null);
+
+    // The bottleneck is spared outright, not floored.
+    try std.testing.expect(!mageflow.isHighPrecision("transformer_blocks.0.img_mod.1.weight"));
 }
 
 test "mage_flow upcasts rmsnorm scales" {
@@ -1453,4 +1731,90 @@ test "sensenova_u15 upcasts every RMSNorm scale of both branches" {
 
     try std.testing.expect(!sensenova_u15.shouldUpcast("language_model.model.layers.3.mlp.up_proj.weight"));
     try std.testing.expect(!sensenova_u15.shouldUpcast("language_model.model.embed_tokens.weight"));
+}
+
+test "llama family detects from GGUF-native and HF name spaces" {
+    const llama_native = [_][]const u8{
+        "output.weight",
+        "output_norm.weight",
+        "token_embd.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.ffn_down.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_norm.weight",
+        "blk.0.ffn_up.weight",
+    };
+    try std.testing.expectEqualStrings("llama", detectArch(&llama_native).?.name);
+
+    const llama_hf = [_][]const u8{
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.0.input_layernorm.weight",
+        "lm_head.weight",
+    };
+    try std.testing.expectEqualStrings("llama", detectArch(&llama_hf).?.name);
+
+    // Per-head q/k norms are what separate qwen3 from plain llama.
+    var qwen3_native: [llama_native.len + 2][]const u8 = undefined;
+    qwen3_native[0] = "blk.0.attn_q_norm.weight";
+    qwen3_native[1] = "blk.0.attn_k_norm.weight";
+    for (llama_native, 0..) |k, i| qwen3_native[i + 2] = k;
+    try std.testing.expectEqualStrings("qwen3", detectArch(&qwen3_native).?.name);
+
+    // Missing the norms must not reach qwen3.
+    try std.testing.expectEqualStrings("llama", detectArch(&llama_native).?.name);
+}
+
+test "qwen35 hybrid matches by ssm keys; moe superset wins over dense" {
+    const dense = [_][]const u8{
+        "output.weight",
+        "output_norm.weight",
+        "token_embd.weight",
+        "blk.0.attn_gate.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_qkv.weight",
+        "blk.0.ffn_down.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_up.weight",
+        "blk.0.post_attention_norm.weight",
+        "blk.0.ssm_a",
+        "blk.0.ssm_alpha.weight",
+        "blk.0.ssm_out.weight",
+        // Full-attention layers the hybrid files also carry.
+        "blk.5.attn_q.weight",
+        "blk.5.attn_q_norm.weight",
+    };
+    try std.testing.expectEqualStrings("qwen35", detectArch(&dense).?.name);
+
+    var moe: [dense.len + 3][]const u8 = undefined;
+    moe[0] = "blk.0.ffn_gate_inp.weight";
+    moe[1] = "blk.0.ffn_up_exps.weight";
+    moe[2] = "blk.0.ffn_down_exps.weight";
+    for (dense, 0..) |k, i| moe[i + 3] = k;
+    // Dense set is a subset of the moe file's names; priority order decides.
+    try std.testing.expectEqualStrings("qwen35moe", detectArch(&moe).?.name);
+}
+
+test "keys_hiprec_named matches whole name or dot segment only" {
+    const named = Arch{
+        .name = "named",
+        .keys_detect = &.{},
+        .threshhold = null,
+        .keys_hiprec_named = &.{"output.weight"},
+    };
+    try std.testing.expect(named.isHighPrecisionNamed("output.weight"));
+    try std.testing.expect(named.isHighPrecisionNamed("model.output.weight"));
+    try std.testing.expect(!named.isHighPrecisionNamed("blk.0.attn_output.weight"));
+    try std.testing.expect(!named.isHighPrecisionNamed("output_norm.weight"));
+    try std.testing.expect(!named.isHighPrecisionNamed("xoutput.weight"));
 }
